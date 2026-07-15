@@ -1,0 +1,17 @@
+[project]
+name = "hft"
+version = "0.1.0"
+description = "Low-latency-oriented market data / signal / paper-trading pipeline, backed by yfinance"
+requires-python = ">=3.11"
+dependencies = [
+    "yfinance>=0.2.40",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
