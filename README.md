@@ -69,6 +69,20 @@ docker build -t hft .
 docker run --rm hft --symbols AAPL MSFT
 ```
 
+## Demo notebook
+
+`notebooks/demo.ipynb` is an executed, end-to-end walkthrough: live tick
+ingestion via `YFinanceSource`, a synthetic crossover run through the
+`RingBuffer -> StrategyEngine -> PaperExecutionVenue` pipeline, latency
+summary stats, and a price/signal chart. Open it directly on GitHub to see
+the saved outputs, or regenerate it (pulls fresh live data and re-executes
+every cell) with:
+
+```bash
+pip install -r requirements-notebook.txt
+python scripts/build_demo_notebook.py
+```
+
 ## Tests
 
 ```bash
