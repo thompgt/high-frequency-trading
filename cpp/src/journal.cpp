@@ -340,7 +340,6 @@ RecoveredState recover_from_journal(const std::string& path) {
   oms_cfg.max_open_orders = 1u << 20;
   oms_cfg.retired_history = 1u << 20;
   OrderManager oms(oms_cfg);
-  std::vector<Order> pending;  // OrderSent records, in file order
 
   std::uint64_t expected_seq = 0;
   for (;;) {
@@ -386,11 +385,13 @@ RecoveredState recover_from_journal(const std::string& path) {
         order.type = static_cast<OrderType>(rec.order_type);
         order.price = rec.price;
         order.quantity = rec.quantity;
-        // The OMS assigns ids densely from 1, and the journal records them in
-        // the order they were assigned, so a straight replay reproduces the
-        // same ids. Anything else would make the exec reports unmatchable.
-        oms.create(order, rec.ts_ns);
-        pending.push_back(order);
+        // Use the id the journal recorded rather than letting the OMS assign a
+        // fresh one. Re-deriving ids only works if the previous run's id
+        // sequence can be reproduced exactly, which it cannot across a
+        // restart -- and a mismatch makes every subsequent execution report
+        // unmatchable, so the whole session replays as unacknowledged orders.
+        oms.create_with_id(rec.cl_ord_id, order, rec.ts_ns);
+        if (rec.cl_ord_id > state.next_cl_ord_id) state.next_cl_ord_id = rec.cl_ord_id;
         break;
       }
 

@@ -305,8 +305,10 @@ int run(int argc, char** argv) {
   // though we do not, and quoting on top of them is how a restart turns a
   // crash into a loss.
   Journal journal;
+  ClOrdId recovered_next_cl_ord_id = 1;
   if (!cfg.journal_path.empty()) {
     const RecoveredState recovered = recover_from_journal(cfg.journal_path);
+    recovered_next_cl_ord_id = recovered.next_cl_ord_id + 1;
     if (!recovered.ok) {
       std::fprintf(stderr, "error: %s\n", recovered.error.c_str());
       log.stop();
@@ -381,7 +383,14 @@ int run(int argc, char** argv) {
     log.stop();
     return kExitConfig;
   }
-  if (journal.is_open()) engine->set_journal(&journal);
+  if (journal.is_open()) {
+    engine->set_journal(&journal);
+    // Continue the client order id sequence past everything the journal has
+    // seen. Restarting ids at 1 would have a venue reject the duplicates and
+    // would make the journal itself unreplayable, since one id would refer to
+    // two different orders.
+    engine->oms().set_next_id(recovered_next_cl_ord_id);
+  }
 
   // --- signals -------------------------------------------------------------
   // The handler only sets a flag. A watcher thread turns that flag into a

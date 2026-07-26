@@ -93,6 +93,22 @@ void OrderManager::add_exposure(SymbolId symbol, Side side, Quantity delta) {
 }
 
 ClOrdId OrderManager::create(const Order& order, Nanos now_ns) {
+  return create_with_id(next_id_, order, now_ns);
+}
+
+void OrderManager::set_next_id(ClOrdId next) {
+  // Only ever forward. Rewinding would reissue ids that are already on the
+  // wire and in the journal.
+  if (next > next_id_) next_id_ = next;
+}
+
+ClOrdId OrderManager::create_with_id(ClOrdId id, const Order& order, Nanos now_ns) {
+  if (id == 0 || slot_for(id) != kNilSlot) {
+    // Id zero is the "no order" sentinel, and a duplicate id would silently
+    // merge two distinct orders into one record.
+    ++stats_.capacity_rejects;
+    return 0;
+  }
   if (order.quantity <= 0) {
     // A zero or negative order is not an order. It never reaches the venue and
     // it never gets an id -- the caller's `if (id == 0)` branch handles it.
@@ -124,7 +140,7 @@ ClOrdId OrderManager::create(const Order& order, Nanos now_ns) {
     slot = evicted_slot;
   }
 
-  const ClOrdId id = next_id_++;
+  if (id >= next_id_) next_id_ = id + 1;
   OrderRecord& rec = pool_[slot];
   rec = OrderRecord{};
   rec.cl_ord_id = id;

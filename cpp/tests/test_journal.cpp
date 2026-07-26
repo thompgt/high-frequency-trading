@@ -32,6 +32,8 @@ Order journal_order(SymbolId sym, Side side, Price px, Quantity qty) {
   return o;
 }
 
+Order make_journal_order() { return journal_order(0, Side::Buy, 10000, 10); }
+
 ExecutionReport journal_report(ClOrdId id, ExecType type, SymbolId sym, Side side, Price px,
                                Quantity qty, double fee = 0.0) {
   ExecutionReport r{};
@@ -533,4 +535,112 @@ TEST(engine_halts_when_the_journal_cannot_be_written) {
   CHECK(stats.journal_failures > 0);
   CHECK(engine.risk().halted());
   CHECK(engine.stop_requested());
+}
+
+TEST(oms_ids_are_unique_across_restarts) {
+    OrderManager first;
+    ClOrdId last = 0;
+    for (int i = 0; i < 10; ++i) last = first.create(make_journal_order(), 1);
+
+    // A fresh manager told where the previous one stopped must not reissue.
+    OrderManager second;
+    second.set_next_id(last + 1);
+    CHECK_EQ(second.create(make_journal_order(), 1), last + 1);
+
+    // set_next_id never rewinds: those ids are already on the wire.
+    second.set_next_id(2);
+    CHECK(second.create(make_journal_order(), 1) > last + 1);
+}
+
+TEST(oms_refuses_to_reuse_a_live_id) {
+    OrderManager oms;
+    CHECK_EQ(oms.create_with_id(7, make_journal_order(), 1), ClOrdId(7));
+    // A duplicate would silently merge two distinct orders into one record.
+    CHECK_EQ(oms.create_with_id(7, make_journal_order(), 1), ClOrdId(0));
+    CHECK_EQ(oms.create_with_id(0, make_journal_order(), 1), ClOrdId(0));
+    // Explicit ids advance the sequence, so a later create() cannot collide.
+    CHECK_EQ(oms.create(make_journal_order(), 1), ClOrdId(8));
+}
+
+TEST(journal_replays_correctly_across_several_sessions) {
+    // Regression: client order ids used to restart at 1 each session, so from
+    // the second session onward every execution report referred to an id the
+    // replay had already assigned to a different order. The whole session
+    // replayed as unacknowledged orders that were in fact filled and closed.
+    const std::string path = scratch("journal_sessions.jrn");
+    remove_file(path);
+
+    ClOrdId next = 1;
+    for (int session = 0; session < 3; ++session) {
+        Journal j;
+        Journal::Config cfg;
+        cfg.path = path;
+        cfg.append = true;
+        CHECK(j.open(cfg));
+        j.record_session_start(session * 1000);
+
+        for (int k = 0; k < 5; ++k) {
+            const ClOrdId id = next++;
+            j.record_order_sent(id, journal_order(0, Side::Buy, 10000, 10), session * 1000 + k);
+            j.record_exec_report(journal_report(id, ExecType::Acked, 0, Side::Buy, 0, 0));
+            j.record_exec_report(journal_report(id, ExecType::Fill, 0, Side::Buy, 10000, 10));
+        }
+        j.record_session_end(session * 1000 + 999);
+        j.close();
+
+        // After every session, replay must show everything closed.
+        const RecoveredState mid = recover_from_journal(path);
+        CHECK(mid.ok);
+        CHECK_EQ(mid.open_orders.size(), std::size_t(0));
+        CHECK_EQ(mid.next_cl_ord_id, next - 1);
+    }
+
+    const RecoveredState state = recover_from_journal(path);
+    CHECK_EQ(state.position(0), std::int64_t(150));  // 3 sessions x 5 orders x 10
+    CHECK_EQ(state.open_orders.size(), std::size_t(0));
+    CHECK(state.clean_shutdown);
+}
+
+TEST(engine_continues_order_ids_across_a_restart) {
+    // End to end: two engine runs sharing one journal must not produce
+    // overlapping client order ids, and the journal must replay clean.
+    const std::string path = scratch("journal_engine_restart.jrn");
+    remove_file(path);
+
+    EngineConfig cfg;
+    cfg.threaded = false;
+    cfg.fast_window = 3;
+    cfg.slow_window = 8;
+    cfg.record_curve = false;
+    cfg.risk.max_orders_per_second = 1000000000u;
+
+    ClOrdId carried = 1;
+    for (int run = 0; run < 3; ++run) {
+        Journal journal;
+        Journal::Config jcfg;
+        jcfg.path = path;
+        jcfg.append = true;
+        CHECK(journal.open(jcfg));
+
+        Engine engine(cfg);
+        engine.set_journal(&journal);
+        engine.oms().set_next_id(carried);
+
+        SyntheticFeed::Params fp;
+        fp.total_events = 30000;
+        fp.seed = 0xA5A5 + static_cast<std::uint64_t>(run);
+        SyntheticFeed feed(fp);
+        EngineStats stats = engine.run(feed);
+        CHECK(stats.orders_sent > 0);
+
+        journal.record_session_end(now_ns());
+        journal.close();
+
+        const RecoveredState state = recover_from_journal(path);
+        CHECK(state.ok);
+        // Nothing is left looking live at the venue after a clean session.
+        CHECK_EQ(state.open_orders.size(), std::size_t(0));
+        CHECK(state.next_cl_ord_id >= carried);
+        carried = state.next_cl_ord_id + 1;
+    }
 }

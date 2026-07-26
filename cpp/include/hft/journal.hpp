@@ -220,6 +220,11 @@ struct RecoveredState {
   std::uint8_t halt_reason = 0;
   Nanos last_ts_ns = 0;
 
+  // Highest client order id seen. The next session must start above this:
+  // reusing an id a venue has already seen gets the order rejected, and a
+  // journal containing the same id twice cannot be replayed unambiguously.
+  ClOrdId next_cl_ord_id = 0;
+
   std::int64_t position(SymbolId symbol) const {
     return symbol < positions.size() ? positions[symbol] : 0;
   }

@@ -170,6 +170,21 @@ class OrderManager : public ExposureSource {
   // cannot track is an order we cannot cancel, reconcile, or bound.
   ClOrdId create(const Order& order, Nanos now_ns);
 
+  // Registers an order under an id we already know. Used by journal recovery,
+  // which must reconstruct the exact ids the previous session used rather than
+  // re-deriving them -- and by anything else adopting an order it did not
+  // originate. Returns 0 if the id is zero, already tracked, or there is no
+  // capacity.
+  ClOrdId create_with_id(ClOrdId id, const Order& order, Nanos now_ns);
+
+  // Sets the id the next create() will hand out. Client order ids must be
+  // unique across restarts -- a venue that sees the same id twice in a session
+  // rejects it, and a journal with repeated ids cannot be replayed at all --
+  // so a restart continues the sequence rather than beginning again at 1.
+  // Ignored if it would move the sequence backwards.
+  void set_next_id(ClOrdId next);
+  ClOrdId next_id() const { return next_id_; }
+
   // Applies a venue report to the state machine. Returns false if the report
   // was not applied; the reason is reflected in the counters.
   bool apply(const ExecutionReport& report);
