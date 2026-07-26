@@ -6,7 +6,8 @@ on:
   pull_request:
 
 jobs:
-  test:
+  python:
+    name: Python research companion
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,3 +16,120 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.txt
       - run: pytest -q
+
+  cpp-cmake:
+    name: C++ engine (CMake, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S cpp -B cpp/build-ci -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build cpp/build-ci --config Release --parallel
+
+      - name: Unit tests
+        run: ctest --test-dir cpp/build-ci --build-config Release --output-on-failure
+
+  cpp-make:
+    name: C++ engine (Makefile + -Werror)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Makefile is the build used on machines without CMake, so it has to
+      # keep working. -Werror is on by default in CXXFLAGS.
+      - name: Build with -Wall -Wextra -Wpedantic -Werror
+        working-directory: cpp
+        run: make -j"$(nproc)"
+
+      - name: Unit tests
+        working-directory: cpp
+        run: ./build/hft_tests
+
+      - name: Engine smoke test
+        working-directory: cpp
+        run: |
+          mkdir -p out
+          ./build/hft_engine --events 200000 --out-dir out \
+            --set max_orders_per_second=100000000
+          test -s out/metrics.json
+          test -s out/latency_summary.csv
+          test -s out/fills.csv
+          test -s out/book_snapshot.csv
+
+      - name: Config validation must reject bad input
+        working-directory: cpp
+        run: |
+          # A typo'd key and a contradictory setting must both fail loudly.
+          ! ./build/hft_engine --set max_postion_per_symbol=10 --events 1000
+          ! ./build/hft_engine --set fast_window=50 --set slow_window=10 --events 1000
+          ./build/hft_engine --config config/engine.conf --print-config
+
+      - name: Deterministic replay must reproduce exactly
+        working-directory: cpp
+        run: |
+          mkdir -p out
+          ./build/hft_engine --write-replay out/replay.csv --replay-events 50000
+          ./build/hft_engine --replay out/replay.csv --out-dir out \
+            --set max_orders_per_second=100000000 > out/run1.txt
+          ./build/hft_engine --replay out/replay.csv --out-dir out \
+            --set max_orders_per_second=100000000 > out/run2.txt
+          # Latency figures legitimately vary run to run; the trading result
+          # must not.
+          grep -E "realized pnl|orders sent|book trades" out/run1.txt > out/r1.txt
+          grep -E "realized pnl|orders sent|book trades" out/run2.txt > out/r2.txt
+          diff out/r1.txt out/r2.txt
+
+  cpp-sanitizers:
+    name: C++ sanitizers (${{ matrix.san }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        san: [asan, ubsan, tsan]
+    steps:
+      - uses: actions/checkout@v4
+      # These need libasan/libubsan/libtsan, which the MSYS2/MinGW toolchain
+      # does not ship -- so they run here rather than on Windows. `make
+      # hardened` below is the MinGW-compatible equivalent.
+      - name: Run test suite under ${{ matrix.san }}
+        working-directory: cpp
+        run: make ${{ matrix.san }}
+
+  cpp-hardened:
+    name: C++ hardened build (no sanitizer runtime required)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # UBSan trap mode + _GLIBCXX_DEBUG + _GLIBCXX_ASSERTIONS + stack
+      # protector. This is the configuration that also runs on MinGW.
+      - name: Run test suite hardened
+        working-directory: cpp
+        run: make hardened
+
+  cpp-benchmarks:
+    name: C++ benchmarks (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        working-directory: cpp
+        run: make -j"$(nproc)" build/hft_bench
+      # CI runners are noisy shared VMs, so these numbers are NOT publishable
+      # figures. This only proves the benchmarks still run and produce output.
+      - name: Run
+        working-directory: cpp
+        run: |
+          mkdir -p out
+          ./build/hft_bench --out-dir out
+          test -s out/bench_results.csv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: cpp/out/bench_*.csv
