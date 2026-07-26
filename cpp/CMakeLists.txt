@@ -26,6 +26,7 @@ add_library(hft_core STATIC
   src/execution.cpp
   src/latency.cpp
   src/oms.cpp
+  src/journal.cpp
   src/engine.cpp
 )
 target_include_directories(hft_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -58,6 +59,7 @@ target_link_libraries(hft_engine PRIVATE hft_core)
 add_executable(hft_tests
   tests/tests_main.cpp
   tests/test_oms.cpp
+  tests/test_journal.cpp
 )
 target_include_directories(hft_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(hft_tests PRIVATE hft_core)
