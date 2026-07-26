@@ -191,7 +191,7 @@ from a crash, and which metrics to alarm on.
 
 ```bash
 cd cpp
-make test          # 239 unit tests
+make test          # 245 unit tests
 make hardened      # UBSan trap mode + _GLIBCXX_DEBUG, works on MinGW
 make asan          # ASan + UBSan (Linux; MinGW ships no sanitizer runtime)
 make tsan
