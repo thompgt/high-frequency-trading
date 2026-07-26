@@ -136,6 +136,7 @@ std::vector<NamedStage> stages_of(const LatencyRecorder& r) {
       {"ingest_to_book", &r.ingest_to_book},
       {"book_update", &r.book_update},
       {"signal_compute", &r.signal_compute},
+      {"risk_check", &r.risk_check},
       {"order_round_trip", &r.order_round_trip},
       {"tick_to_order", &r.tick_to_order},
   };
@@ -147,6 +148,7 @@ void LatencyRecorder::reset() {
   ingest_to_book.reset();
   book_update.reset();
   signal_compute.reset();
+  risk_check.reset();
   order_round_trip.reset();
   tick_to_order.reset();
 }

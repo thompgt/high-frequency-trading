@@ -17,6 +17,7 @@
 #include "hft/latency.hpp"
 #include "hft/order_book.hpp"
 #include "hft/ring_buffer.hpp"
+#include "hft/risk.hpp"
 #include "hft/strategy.hpp"
 #include "test_harness.hpp"
 
@@ -897,7 +898,8 @@ TEST(engine_runs_end_to_end_and_keeps_the_book_consistent) {
   CHECK(st.cancels > 0);
   CHECK(st.book_trades > 0);
   CHECK(st.signals > 0);
-  CHECK_EQ(st.orders_sent, st.signals);
+  // Every signal is either sent or stopped by risk -- nothing is lost silently.
+  CHECK_EQ(st.signals, st.orders_sent + st.risk_rejects);
   CHECK_EQ(st.dropped_ticks, std::uint64_t(0));
 
   const Price bb = e.book().best_bid();
@@ -945,6 +947,410 @@ TEST(engine_writes_the_csvs_the_notebook_consumes) {
   CHECK(e.latency().write_histogram_csv("build/test_latency_hist.csv"));
   CHECK(e.venue().write_fills_csv("build/test_fills.csv"));
   CHECK(e.write_book_snapshot_csv("build/test_book.csv", 10));
+}
+
+
+// =========================================== self-match prevention (order book)
+
+TEST(book_without_stp_lets_an_owner_trade_against_itself) {
+  OrderBook b = make_book();
+  b.add_limit(1, Side::Sell, 10000, 10, nullptr, /*owner=*/7);
+  std::vector<Trade> trades;
+  b.add_limit(2, Side::Buy, 10000, 10, &trades, /*owner=*/7);
+  CHECK_EQ(trades.size(), std::size_t(1));  // documented default: no STP
+  CHECK_EQ(b.self_match_preventions(), std::uint64_t(0));
+}
+
+TEST(book_stp_cancel_resting_skips_own_order_and_trades_the_next) {
+  OrderBook b = make_book();
+  b.set_self_match_policy(SelfMatchPolicy::CancelResting);
+  b.add_limit(1, Side::Sell, 10000, 10, nullptr, /*owner=*/7);   // ours
+  b.add_limit(2, Side::Sell, 10000, 10, nullptr, /*owner=*/9);   // someone else's
+
+  std::vector<Trade> trades;
+  const Quantity filled = b.add_limit(3, Side::Buy, 10000, 10, &trades, /*owner=*/7);
+  CHECK_EQ(filled, Quantity(10));
+  CHECK_EQ(trades.size(), std::size_t(1));
+  CHECK_EQ(trades[0].resting_id, OrderId(2));   // traded with the other party
+  CHECK_FALSE(b.has_order(1));                  // our resting order was cancelled
+  CHECK_EQ(b.self_match_preventions(), std::uint64_t(1));
+  CHECK_EQ(b.live_order_count(), std::size_t(0));
+}
+
+TEST(book_stp_cancel_aggressor_stops_the_order_without_resting_it) {
+  OrderBook b = make_book();
+  b.set_self_match_policy(SelfMatchPolicy::CancelAggressor);
+  b.add_limit(1, Side::Sell, 10000, 10, nullptr, /*owner=*/7);
+
+  std::vector<Trade> trades;
+  const Quantity filled = b.add_limit(2, Side::Buy, 10000, 25, &trades, /*owner=*/7);
+  CHECK_EQ(filled, Quantity(0));
+  CHECK_EQ(trades.size(), std::size_t(0));
+  CHECK(b.has_order(1));            // resting order untouched
+  CHECK_FALSE(b.has_order(2));      // aggressor remainder was NOT rested
+  CHECK_EQ(b.self_match_preventions(), std::uint64_t(1));
+  CHECK_EQ(b.best_bid(), kNoPrice);
+}
+
+TEST(book_stp_ignores_unowned_orders) {
+  // owner 0 means "unspecified"; STP must not fire and merge unrelated flow.
+  OrderBook b = make_book();
+  b.set_self_match_policy(SelfMatchPolicy::CancelResting);
+  b.add_limit(1, Side::Sell, 10000, 10);  // owner 0
+  std::vector<Trade> trades;
+  b.add_limit(2, Side::Buy, 10000, 10, &trades);  // owner 0
+  CHECK_EQ(trades.size(), std::size_t(1));
+  CHECK_EQ(b.self_match_preventions(), std::uint64_t(0));
+}
+
+TEST(book_stp_survives_partial_depth_exhaustion) {
+  OrderBook b = make_book();
+  b.set_self_match_policy(SelfMatchPolicy::CancelResting);
+  b.add_limit(1, Side::Sell, 10000, 5, nullptr, 7);
+  b.add_limit(2, Side::Sell, 10010, 5, nullptr, 7);
+  std::vector<Trade> trades;
+  // Every level belongs to us: the aggressor cancels its way through the whole
+  // book and ends up resting with nothing traded.
+  const Quantity filled = b.add_limit(3, Side::Buy, 10020, 8, &trades, 7);
+  CHECK_EQ(filled, Quantity(0));
+  CHECK_EQ(trades.size(), std::size_t(0));
+  CHECK_EQ(b.self_match_preventions(), std::uint64_t(2));
+  CHECK_EQ(b.best_ask(), kNoPrice);
+  CHECK_EQ(b.best_bid(), Price(10020));  // remainder rests under CancelResting
+}
+
+// ================================================================ RiskManager
+
+namespace {
+
+RiskLimits permissive_limits() {
+  RiskLimits l;
+  l.max_order_quantity = 1000;
+  l.max_order_notional = 1000000.0;
+  l.max_position_per_symbol = 10000;
+  l.max_gross_position = 20000;
+  l.price_collar_bps = 500.0;
+  l.max_orders_per_second = 1000000;
+  l.max_daily_orders = 1000000;
+  l.max_drawdown = 10000.0;
+  return l;
+}
+
+Order risk_order(Side side, Quantity qty, Price price = 10000, SymbolId sym = 0) {
+  Order o{};
+  o.id = 1;
+  o.symbol = sym;
+  o.side = side;
+  o.type = OrderType::Market;
+  o.price = price;
+  o.quantity = qty;
+  return o;
+}
+
+Fill fill_of(const Order& o, Quantity qty) {
+  Fill f{};
+  f.symbol = o.symbol;
+  f.side = o.side;
+  f.quantity = qty;
+  f.price = o.price;
+  return f;
+}
+
+}  // namespace
+
+TEST(risk_accepts_an_ordinary_order) {
+  RiskManager r(permissive_limits());
+  const auto d = r.check(risk_order(Side::Buy, 10), 10000, 0);
+  CHECK(d.accepted);
+  CHECK(d.reason == RejectReason::None);
+  CHECK_EQ(r.accepted_orders(), std::uint64_t(1));
+  CHECK_EQ(r.rejected_orders(), std::uint64_t(0));
+}
+
+TEST(risk_rejects_non_positive_quantity_even_when_disabled) {
+  RiskLimits l = permissive_limits();
+  l.enabled = false;
+  RiskManager r(l);
+  const auto d = r.check(risk_order(Side::Buy, 0), 10000, 0);
+  CHECK_FALSE(d.accepted);
+  CHECK(d.reason == RejectReason::InvalidOrder);
+}
+
+TEST(risk_rejects_fat_finger_quantity) {
+  RiskLimits l = permissive_limits();
+  l.max_order_quantity = 100;
+  RiskManager r(l);
+  CHECK(r.check(risk_order(Side::Buy, 100), 10000, 0).accepted);
+  const auto d = r.check(risk_order(Side::Buy, 101), 10000, 0);
+  CHECK_FALSE(d.accepted);
+  CHECK(d.reason == RejectReason::OrderQuantityTooLarge);
+  CHECK_EQ(r.rejects(RejectReason::OrderQuantityTooLarge), std::uint64_t(1));
+}
+
+TEST(risk_rejects_fat_finger_notional) {
+  RiskLimits l = permissive_limits();
+  l.max_order_notional = 50000.0;  // $50k
+  RiskManager r(l);
+  // 400 shares at $100 = $40k: fine. 600 = $60k: not.
+  CHECK(r.check(risk_order(Side::Buy, 400, 10000), 10000, 0).accepted);
+  const auto d = r.check(risk_order(Side::Buy, 600, 10000), 10000, 0);
+  CHECK_FALSE(d.accepted);
+  CHECK(d.reason == RejectReason::OrderNotionalTooLarge);
+}
+
+TEST(risk_rejects_prices_outside_the_collar) {
+  RiskLimits l = permissive_limits();
+  l.price_collar_bps = 100.0;  // 1%
+  RiskManager r(l);
+  CHECK(r.check(risk_order(Side::Buy, 1, 10090), 10000, 0).accepted);   // +0.9%
+  const auto hi = r.check(risk_order(Side::Buy, 1, 10200), 10000, 0);   // +2%
+  CHECK_FALSE(hi.accepted);
+  CHECK(hi.reason == RejectReason::PriceOutsideCollar);
+  const auto lo = r.check(risk_order(Side::Sell, 1, 9800), 10000, 0);   // -2%
+  CHECK_FALSE(lo.accepted);
+  CHECK(lo.reason == RejectReason::PriceOutsideCollar);
+  CHECK_EQ(r.rejects(RejectReason::PriceOutsideCollar), std::uint64_t(2));
+}
+
+TEST(risk_enforces_per_symbol_position_limit) {
+  RiskLimits l = permissive_limits();
+  l.max_position_per_symbol = 100;
+  RiskManager r(l);
+
+  const Order buy = risk_order(Side::Buy, 100);
+  CHECK(r.check(buy, 10000, 0).accepted);
+  r.on_fill(fill_of(buy, 100));
+  CHECK_EQ(r.position(0), std::int64_t(100));
+
+  // Another buy would take us to 200: rejected.
+  const auto d = r.check(risk_order(Side::Buy, 100), 10000, 0);
+  CHECK_FALSE(d.accepted);
+  CHECK(d.reason == RejectReason::PositionLimitExceeded);
+
+  // But selling reduces exposure and must still be allowed.
+  CHECK(r.check(risk_order(Side::Sell, 100), 10000, 0).accepted);
+}
+
+TEST(risk_position_limit_is_symmetric_for_shorts) {
+  RiskLimits l = permissive_limits();
+  l.max_position_per_symbol = 50;
+  RiskManager r(l);
+  const Order sell = risk_order(Side::Sell, 50);
+  CHECK(r.check(sell, 10000, 0).accepted);
+  r.on_fill(fill_of(sell, 50));
+  CHECK_EQ(r.position(0), std::int64_t(-50));
+  const auto d = r.check(risk_order(Side::Sell, 10), 10000, 0);
+  CHECK_FALSE(d.accepted);
+  CHECK(d.reason == RejectReason::PositionLimitExceeded);
+}
+
+TEST(risk_enforces_gross_position_across_symbols) {
+  RiskLimits l = permissive_limits();
+  l.max_position_per_symbol = 1000;
+  l.max_gross_position = 150;
+  RiskManager r(l);
+
+  const Order a = risk_order(Side::Buy, 100, 10000, /*sym=*/0);
+  CHECK(r.check(a, 10000, 0).accepted);
+  r.on_fill(fill_of(a, 100));
+
+  // A short in another symbol still adds to *gross* exposure.
+  const auto d = r.check(risk_order(Side::Sell, 100, 10000, /*sym=*/1), 10000, 0);
+  CHECK_FALSE(d.accepted);
+  CHECK(d.reason == RejectReason::GrossPositionLimitExceeded);
+
+  const Order small = risk_order(Side::Sell, 40, 10000, /*sym=*/1);
+  CHECK(r.check(small, 10000, 0).accepted);
+  r.on_fill(fill_of(small, 40));
+  CHECK_EQ(r.gross_position(), std::int64_t(140));
+}
+
+TEST(risk_throttles_orders_per_second) {
+  RiskLimits l = permissive_limits();
+  l.max_orders_per_second = 3;
+  RiskManager r(l);
+  const Nanos t0 = 1000000000;
+
+  for (int i = 0; i < 3; ++i) CHECK(r.check(risk_order(Side::Buy, 1), 10000, t0).accepted);
+  const auto d = r.check(risk_order(Side::Buy, 1), 10000, t0);
+  CHECK_FALSE(d.accepted);
+  CHECK(d.reason == RejectReason::ThrottleExceeded);
+
+  // A new one-second window resets the allowance.
+  CHECK(r.check(risk_order(Side::Buy, 1), 10000, t0 + 1000000000).accepted);
+}
+
+TEST(risk_daily_order_limit_engages_the_kill_switch) {
+  RiskLimits l = permissive_limits();
+  l.max_daily_orders = 2;
+  RiskManager r(l);
+  CHECK(r.check(risk_order(Side::Buy, 1), 10000, 0).accepted);
+  CHECK(r.check(risk_order(Side::Buy, 1), 10000, 0).accepted);
+
+  const auto d = r.check(risk_order(Side::Buy, 1), 10000, 0);
+  CHECK_FALSE(d.accepted);
+  CHECK(d.reason == RejectReason::DailyOrderLimitExceeded);
+  CHECK(r.halted());
+  CHECK(r.halt_reason() == HaltReason::DailyOrderLimit);
+
+  // Rolling the day clears the counter but deliberately NOT the kill switch.
+  r.roll_day();
+  CHECK(r.halted());
+  const auto d2 = r.check(risk_order(Side::Buy, 1), 10000, 0);
+  CHECK(d2.reason == RejectReason::KillSwitchEngaged);
+  r.release_kill_switch();
+  CHECK(r.check(risk_order(Side::Buy, 1), 10000, 0).accepted);
+}
+
+TEST(risk_drawdown_breach_trips_the_kill_switch_and_is_sticky) {
+  RiskLimits l = permissive_limits();
+  l.max_drawdown = 500.0;
+  RiskManager r(l);
+
+  r.on_equity(1000.0);   // peak
+  r.on_equity(700.0);    // -300, within budget
+  CHECK_FALSE(r.halted());
+  CHECK_NEAR(r.drawdown(), 300.0, 1e-9);
+
+  r.on_equity(400.0);    // -600, breach
+  CHECK(r.halted());
+  CHECK(r.halt_reason() == HaltReason::DrawdownBreach);
+  CHECK(r.should_flatten());
+
+  // Recovering does NOT un-halt: the day's loss budget is already spent.
+  r.on_equity(1200.0);
+  CHECK(r.halted());
+
+  const auto d = r.check(risk_order(Side::Buy, 1), 10000, 0);
+  CHECK_FALSE(d.accepted);
+  CHECK(d.reason == RejectReason::KillSwitchEngaged);
+}
+
+TEST(risk_manual_kill_switch_blocks_everything) {
+  RiskManager r(permissive_limits());
+  CHECK_FALSE(r.halted());
+  r.engage_kill_switch(HaltReason::Manual);
+  CHECK(r.halted());
+  const auto d = r.check(risk_order(Side::Buy, 1), 10000, 0);
+  CHECK_FALSE(d.accepted);
+  CHECK(d.reason == RejectReason::KillSwitchEngaged);
+  CHECK_EQ(r.rejects(RejectReason::KillSwitchEngaged), std::uint64_t(1));
+
+  r.release_kill_switch();
+  CHECK_FALSE(r.halted());
+  CHECK(r.check(risk_order(Side::Buy, 1), 10000, 0).accepted);
+}
+
+TEST(risk_first_halt_reason_wins) {
+  RiskManager r(permissive_limits());
+  r.engage_kill_switch(HaltReason::DrawdownBreach);
+  r.engage_kill_switch(HaltReason::Manual);
+  CHECK(r.halt_reason() == HaltReason::DrawdownBreach);
+}
+
+TEST(risk_disabled_limits_still_count_orders) {
+  RiskLimits l = permissive_limits();
+  l.enabled = false;
+  l.max_order_quantity = 1;
+  RiskManager r(l);
+  CHECK(r.check(risk_order(Side::Buy, 1000000), 10000, 0).accepted);
+  CHECK_EQ(r.accepted_orders(), std::uint64_t(1));
+}
+
+TEST(risk_rejects_when_no_usable_price_is_available) {
+  RiskManager r(permissive_limits());
+  const auto d = r.check(risk_order(Side::Buy, 1, /*price=*/0), /*reference=*/0, 0);
+  CHECK_FALSE(d.accepted);
+  CHECK(d.reason == RejectReason::InvalidOrder);
+}
+
+TEST(risk_summary_lists_reject_reasons) {
+  RiskLimits l = permissive_limits();
+  l.max_order_quantity = 1;
+  RiskManager r(l);
+  r.check(risk_order(Side::Buy, 99), 10000, 0);
+  const std::string s = r.summary();
+  CHECK(s.find("order_quantity_too_large") != std::string::npos);
+}
+
+// ================================================== engine <-> risk integration
+
+TEST(engine_stops_sending_orders_once_a_limit_binds) {
+  // The crossover strategy alternates buy/sell, so it never builds a large
+  // position on its own. Bind the fat-finger size limit instead: it is
+  // unconditional, so every order the strategy produces must be stopped.
+  EngineConfig cfg;
+  cfg.threaded = false;
+  cfg.order_quantity = 10;
+  cfg.risk.max_order_quantity = 5;         // smaller than every order we send
+  cfg.risk.max_orders_per_second = 100'000'000;
+  Engine e(cfg);
+
+  SyntheticFeed::Params p;
+  p.total_events = 200000;
+  p.seed = 31337;
+  SyntheticFeed feed(p);
+  const EngineStats st = e.run(feed);
+
+  CHECK(st.signals > 0);
+  CHECK_EQ(st.orders_sent, std::uint64_t(0));       // nothing reached the venue
+  CHECK_EQ(st.risk_rejects, st.signals);
+  CHECK_EQ(e.venue().position(0), std::int64_t(0));
+  CHECK_EQ(e.risk().rejects(RejectReason::OrderQuantityTooLarge), st.signals);
+}
+
+TEST(engine_throttle_caps_order_rate_over_a_compressed_run) {
+  // A synthetic run replays far faster than real time, so a production-sane
+  // 1000 orders/sec throttle binds hard. That is the throttle working, and the
+  // engine must keep running rather than treating it as an error.
+  EngineConfig cfg;
+  cfg.threaded = false;
+  cfg.order_quantity = 1;
+  cfg.risk.max_orders_per_second = 100;
+  Engine e(cfg);
+
+  SyntheticFeed::Params p;
+  p.total_events = 300000;
+  p.seed = 777;
+  SyntheticFeed feed(p);
+  const EngineStats st = e.run(feed);
+
+  CHECK(st.signals > 0);
+  CHECK(e.risk().rejects(RejectReason::ThrottleExceeded) > 0);
+  CHECK_EQ(st.signals, st.orders_sent + st.risk_rejects);
+  CHECK_FALSE(e.risk().halted());  // a throttle is back-pressure, not a halt
+}
+
+TEST(engine_flatten_closes_out_inventory) {
+  EngineConfig cfg;
+  cfg.threaded = false;
+  cfg.order_quantity = 10;
+  Engine e(cfg);
+
+  SyntheticFeed::Params p;
+  p.total_events = 100000;
+  p.seed = 4242;
+  SyntheticFeed feed(p);
+  EngineStats st = e.run(feed);
+
+  if (e.venue().position(0) != 0) {
+    const std::uint64_t sent = e.flatten(st);
+    CHECK(sent > 0);
+    CHECK_EQ(e.venue().position(0), std::int64_t(0));
+    CHECK_EQ(e.risk().position(0), std::int64_t(0));
+  }
+}
+
+TEST(engine_honours_a_stop_request) {
+  EngineConfig cfg;
+  cfg.threaded = false;
+  Engine e(cfg);
+  SyntheticFeed::Params p;
+  p.total_events = 1000000;
+  SyntheticFeed feed(p);
+  e.request_stop();
+  const EngineStats st = e.run(feed);
+  CHECK_EQ(st.ticks, std::uint64_t(0));  // stopped before consuming anything
 }
 
 // ====================================================================== main

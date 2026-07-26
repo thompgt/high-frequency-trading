@@ -18,7 +18,7 @@
 CXX      ?= g++
 CXXSTD   ?= c++17
 OPT      ?= -O2
-CXXFLAGS ?= -std=$(CXXSTD) $(OPT) -Wall -Wextra -Wpedantic -Iinclude
+CXXFLAGS ?= -std=$(CXXSTD) $(OPT) -Wall -Wextra -Wpedantic -Werror -Iinclude
 LDFLAGS  ?=
 LDLIBS   ?=
 

@@ -111,6 +111,7 @@ class LatencyRecorder {
   LatencyHistogram ingest_to_book;   // feed timestamp -> book updated
   LatencyHistogram book_update;      // time inside OrderBook::apply
   LatencyHistogram signal_compute;   // time inside Strategy::on_tick
+  LatencyHistogram risk_check;       // time inside RiskManager::check
   LatencyHistogram order_round_trip; // Strategy signal -> venue fill returned
   LatencyHistogram tick_to_order;    // end-to-end: feed timestamp -> fill
 

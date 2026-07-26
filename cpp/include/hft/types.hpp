@@ -18,6 +18,7 @@ using Price = std::int64_t;     // integer price ticks (cents by default)
 using Quantity = std::int64_t;  // share/contract count
 using OrderId = std::uint64_t;
 using SymbolId = std::uint32_t;
+using OwnerId = std::uint32_t;  // participant/account id; 0 means "unspecified"
 using Nanos = std::int64_t;
 
 // Ticks per unit of currency. Price 12345 == $123.45.

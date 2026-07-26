@@ -261,12 +261,13 @@ void OrderBook::unlink(PriceLevel& level, std::uint32_t slot) {
 
 // --- matching ---------------------------------------------------------------
 
-Quantity OrderBook::match(OrderId aggressor_id, Side aggressor_side, Price limit,
-                          Quantity qty, std::vector<Trade>* out) {
+Quantity OrderBook::match(OrderId aggressor_id, OwnerId aggressor_owner, Side aggressor_side,
+                          Price limit, Quantity qty, std::vector<Trade>* out) {
   const Side resting_side = opposite(aggressor_side);
   auto& levels = side_levels(resting_side);
   auto& map = side_bitmap(resting_side);
 
+  aggressor_stopped_ = false;
   Quantity filled = 0;
   while (qty > 0) {
     // Resting bids fill best (highest) first; resting asks best (lowest) first.
@@ -285,6 +286,26 @@ Quantity OrderBook::match(OrderId aggressor_id, Side aggressor_side, Price limit
     while (qty > 0 && level.head != kNilNode) {
       const std::uint32_t slot = level.head;  // FIFO: oldest resting order first
       OrderNode& node = pool_[slot];
+
+      // Self-match prevention, checked before any quantity changes hands.
+      if (smp_ != SelfMatchPolicy::None && aggressor_owner != 0 &&
+          node.owner == aggressor_owner) {
+        ++smp_events_;
+        if (smp_ == SelfMatchPolicy::CancelResting) {
+          const OrderId victim = node.id;
+          level.total_quantity -= node.quantity;
+          unlink(level, slot);
+          id_erase(victim);
+          free_node(slot);
+          --live_orders_;
+          continue;  // aggressor moves on to the next resting order
+        }
+        // CancelAggressor: stop here and tell add_limit not to rest the rest.
+        aggressor_stopped_ = true;
+        if (level.order_count == 0) map.clear(idx);
+        return filled;
+      }
+
       const Quantity traded = std::min(qty, node.quantity);
 
       node.quantity -= traded;
@@ -314,14 +335,17 @@ Quantity OrderBook::match(OrderId aggressor_id, Side aggressor_side, Price limit
 }
 
 Quantity OrderBook::add_limit(OrderId id, Side side, Price price, Quantity qty,
-                              std::vector<Trade>* out) {
+                              std::vector<Trade>* out, OwnerId owner) {
   if (qty <= 0 || id == kEmptyKey || id == kTombstone) return -1;
   if (!in_band(price)) return -1;
   if (slot_for(id) != kNilNode) return -1;  // duplicate live id
 
-  const Quantity filled = match(id, side, price, qty, out);
+  const Quantity filled = match(id, owner, side, price, qty, out);
   const Quantity remaining = qty - filled;
   if (remaining <= 0) return filled;
+  // Self-match prevention chose to stop this order rather than let it trade
+  // against its own resting liquidity: the remainder is cancelled, not rested.
+  if (aggressor_stopped_) return filled;
 
   const std::size_t idx = index_of(price);
   PriceLevel& level = side_levels(side)[idx];
@@ -330,6 +354,7 @@ Quantity OrderBook::add_limit(OrderId id, Side side, Price price, Quantity qty,
   pool_[slot].price = price;
   pool_[slot].quantity = remaining;
   pool_[slot].side = side;
+  pool_[slot].owner = owner;
   pool_[slot].live = true;
 
   link_back(level, slot);
@@ -342,9 +367,9 @@ Quantity OrderBook::add_limit(OrderId id, Side side, Price price, Quantity qty,
 }
 
 Quantity OrderBook::execute_market(OrderId id, Side side, Quantity qty,
-                                   std::vector<Trade>* out) {
+                                   std::vector<Trade>* out, OwnerId owner) {
   if (qty <= 0) return 0;
-  return match(id, side, kNoPrice, qty, out);
+  return match(id, owner, side, kNoPrice, qty, out);
 }
 
 bool OrderBook::cancel(OrderId id) {
@@ -384,8 +409,9 @@ bool OrderBook::modify(OrderId id, Price new_price, Quantity new_qty,
   // Reprice or size increase: cancel/replace, losing time priority. The
   // replacement may be marketable, so it goes through the normal add path.
   const Side side = node.side;
+  const OwnerId owner = node.owner;
   cancel(id);
-  add_limit(id, side, new_price, new_qty, out);
+  add_limit(id, side, new_price, new_qty, out, owner);
   return true;
 }
 
@@ -401,6 +427,8 @@ void OrderBook::clear() {
   std::fill(id_vals_.begin(), id_vals_.end(), kNilNode);
   id_count_ = 0;
   id_tombstones_ = 0;
+  smp_events_ = 0;
+  aggressor_stopped_ = false;
 }
 
 // --- accessors --------------------------------------------------------------

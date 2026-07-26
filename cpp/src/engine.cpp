@@ -12,6 +12,7 @@ Engine::Engine(EngineConfig config)
       strategy_(config.fast_window, config.slow_window),
       venue_(PaperVenue::Config{config.slippage_bps, config.fee_bps,
                                 config.cross_book ? &book_ : nullptr}),
+      risk_(config.risk),
       ring_(config.ring_capacity) {
   trade_scratch_.reserve(256);
   venue_.set_record_curve(config.record_curve);
@@ -60,9 +61,12 @@ void Engine::process(const Tick& tick, EngineStats& stats) {
     reference = price_from_double(mid);
   } else if (tick.price > 0) {
     reference = tick.price;
+  } else if (last_reference_ > 0) {
+    reference = last_reference_;
   } else {
     return;  // one-sided empty book and no usable price on this message
   }
+  last_reference_ = reference;
 
   // --- stage 3: strategy ---------------------------------------------------
   Signal signal{};
@@ -73,7 +77,7 @@ void Engine::process(const Tick& tick, EngineStats& stats) {
   if (!fired) return;
   ++stats.signals;
 
-  // --- stage 4: execution --------------------------------------------------
+  // --- stage 4: pre-trade risk ---------------------------------------------
   Order order{};
   order.id = next_order_id_++;
   order.symbol = signal.symbol;
@@ -83,14 +87,63 @@ void Engine::process(const Tick& tick, EngineStats& stats) {
   order.quantity = cfg_.order_quantity;
   order.created_ts_ns = sig_end;
 
+  const Nanos risk_start = now_ns();
+  const RiskDecision decision = risk_.check(order, reference, risk_start);
+  latency_.risk_check.record(now_ns() - risk_start);
+
+  if (!decision) {
+    // Rejections are counted by reason inside RiskManager; the engine only
+    // needs the aggregate. Nothing is sent, and the run continues -- a
+    // rejected order is a normal outcome, not a fatal error.
+    ++stats.risk_rejects;
+    return;
+  }
+
+  // --- stage 5: execution --------------------------------------------------
   const Nanos ord_start = now_ns();
   const Fill fill = venue_.submit(order, signal.price);
   const Nanos ord_end = now_ns();
-  (void)fill;
 
   latency_.order_round_trip.record(ord_end - ord_start);
   latency_.tick_to_order.record(ord_end - tick.ingest_ts_ns);
   ++stats.orders_sent;
+
+  // --- stage 6: post-trade risk --------------------------------------------
+  risk_.on_fill(fill);
+  risk_.on_equity(venue_.equity(order.symbol, reference));
+  if (risk_.halted()) stats.halted = true;
+}
+
+std::uint64_t Engine::flatten(EngineStats& stats) {
+  std::uint64_t sent = 0;
+  double mid = 0.0;
+  const bool have_mid = book_.mid_price(mid);
+
+  // Snapshot first: submitting mutates the venue's position map.
+  std::vector<std::pair<SymbolId, std::int64_t>> open;
+  for (const auto& kv : venue_.positions()) {
+    if (kv.second != 0) open.emplace_back(kv.first, kv.second);
+  }
+
+  for (const auto& kv : open) {
+    Order order{};
+    order.id = next_order_id_++;
+    order.symbol = kv.first;
+    order.side = kv.second > 0 ? Side::Sell : Side::Buy;
+    order.type = OrderType::Market;
+    order.quantity = kv.second > 0 ? kv.second : -kv.second;
+    order.created_ts_ns = now_ns();
+
+    // Mark the exit at the book mid, or the last fair value we saw. Flattening
+    // against a price of zero would silently book a fictional loss.
+    const Price reference = have_mid ? price_from_double(mid) : last_reference_;
+    if (reference <= 0) continue;  // never seen a usable price: nothing sane to do
+    const Fill fill = venue_.submit(order, reference);
+    risk_.on_fill(fill);
+    ++sent;
+    ++stats.flatten_orders;
+  }
+  return sent;
 }
 
 EngineStats Engine::run(MarketDataSource& feed) {
@@ -101,7 +154,7 @@ EngineStats Engine::run_inline(MarketDataSource& feed) {
   EngineStats stats;
   Tick tick;
   const Nanos t0 = now_ns();
-  while (feed.next(tick)) process(tick, stats);
+  while (!stop_requested() && feed.next(tick)) process(tick, stats);
   stats.wall_ns = now_ns() - t0;
   return stats;
 }
@@ -113,7 +166,7 @@ EngineStats Engine::run_threaded(MarketDataSource& feed) {
 
   std::thread producer([&] {
     Tick tick;
-    while (feed.next(tick)) {
+    while (!stop_requested() && feed.next(tick)) {
       // Spin until the consumer makes room. Dropping would be the other valid
       // policy (and the ring counts drops when try_push fails); here we would
       // rather not silently lose messages in the demo, so we back off instead.
@@ -131,6 +184,7 @@ EngineStats Engine::run_threaded(MarketDataSource& feed) {
       continue;
     }
     if (producer_done.load(std::memory_order_acquire) && ring_.empty_approx()) break;
+    if (stop_requested() && producer_done.load(std::memory_order_acquire)) break;
     std::this_thread::yield();
   }
 

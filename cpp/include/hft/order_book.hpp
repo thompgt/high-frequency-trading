@@ -71,6 +71,17 @@ class LevelBitmap {
   std::uint64_t l2_word_ = 0;  // one bit per l1_ word; caps the band at 64*64*64 = 262144 levels
 };
 
+// Self-match prevention. Exchanges require it and so does any firm running
+// more than one strategy against the same book: trading with yourself pays the
+// spread and the fees for no economic reason, and in most venues it is a
+// compliance violation. Off by default so a book with no participant identity
+// behaves exactly as before.
+enum class SelfMatchPolicy : std::uint8_t {
+  None = 0,        // no STP; an aggressor may trade against its own resting order
+  CancelResting,   // drop the resting order, aggressor continues to the next
+  CancelAggressor, // stop the aggressor; its remainder is not rested
+};
+
 class OrderBook {
  public:
   struct LevelView {
@@ -89,12 +100,12 @@ class OrderBook {
   // Returns the quantity filled immediately, or -1 if the order was rejected
   // (duplicate live id, price out of band, non-positive quantity).
   Quantity add_limit(OrderId id, Side side, Price price, Quantity qty,
-                     std::vector<Trade>* out = nullptr);
+                     std::vector<Trade>* out = nullptr, OwnerId owner = 0);
 
   // Marketable-to-any-price order. Never rests; unfilled remainder is dropped.
   // Returns quantity filled.
   Quantity execute_market(OrderId id, Side side, Quantity qty,
-                          std::vector<Trade>* out = nullptr);
+                          std::vector<Trade>* out = nullptr, OwnerId owner = 0);
 
   // Removes a resting order. Returns false if the id is not live.
   bool cancel(OrderId id);
@@ -107,6 +118,11 @@ class OrderBook {
               std::vector<Trade>* out = nullptr);
 
   void clear();
+
+  void set_self_match_policy(SelfMatchPolicy p) { smp_ = p; }
+  SelfMatchPolicy self_match_policy() const { return smp_; }
+  // Number of resting orders cancelled, or aggressors stopped, by STP.
+  std::uint64_t self_match_preventions() const { return smp_events_; }
 
   // --- read-only accessors -------------------------------------------------
 
@@ -135,6 +151,7 @@ class OrderBook {
     Quantity quantity = 0;
     std::uint32_t prev = kNilNode;
     std::uint32_t next = kNilNode;
+    OwnerId owner = 0;
     Side side = Side::Buy;
     bool live = false;
   };
@@ -172,8 +189,8 @@ class OrderBook {
 
   // Consumes resting liquidity on `resting_side` up to `limit` (kNoPrice means
   // any price). Returns quantity filled and appends trades.
-  Quantity match(OrderId aggressor_id, Side aggressor_side, Price limit,
-                 Quantity qty, std::vector<Trade>* out);
+  Quantity match(OrderId aggressor_id, OwnerId aggressor_owner, Side aggressor_side,
+                 Price limit, Quantity qty, std::vector<Trade>* out);
 
   // Order-id lookup. A hash map is the general answer; ids here are dense
   // (assigned by our own feed/strategy), so a direct-mapped slot table with a
@@ -187,6 +204,12 @@ class OrderBook {
   std::vector<PriceLevel> asks_;
   LevelBitmap bid_map_;
   LevelBitmap ask_map_;
+
+  SelfMatchPolicy smp_ = SelfMatchPolicy::None;
+  std::uint64_t smp_events_ = 0;
+  // Set by match() when CancelAggressor fires, so add_limit knows not to rest
+  // the remainder of an order the policy just stopped.
+  bool aggressor_stopped_ = false;
 
   std::vector<OrderNode> pool_;
   std::uint32_t free_head_ = kNilNode;

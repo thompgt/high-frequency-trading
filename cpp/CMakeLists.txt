@@ -17,6 +17,7 @@ option(HFT_NATIVE_ARCH "Build with -march=native (faster, not portable)" OFF)
 
 add_library(hft_core STATIC
   src/order_book.cpp
+  src/risk.cpp
   src/feed.cpp
   src/strategy.cpp
   src/execution.cpp
