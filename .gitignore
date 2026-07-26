@@ -19,3 +19,5 @@ cpp/cmake-build*/
 *.d
 *.a
 *.obj
+cpp/out/
+cpp/build-*/

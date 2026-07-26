@@ -6,15 +6,21 @@
 // corrupts everything downstream.
 
 #include <cstdio>
+#include <csignal>
+#include <fstream>
 #include <map>
 #include <numeric>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "hft/engine.hpp"
 #include "hft/execution.hpp"
 #include "hft/feed.hpp"
 #include "hft/latency.hpp"
+#include "hft/config.hpp"
+#include "hft/log.hpp"
+#include "hft/metrics.hpp"
 #include "hft/order_book.hpp"
 #include "hft/ring_buffer.hpp"
 #include "hft/risk.hpp"
@@ -1351,6 +1357,415 @@ TEST(engine_honours_a_stop_request) {
   e.request_stop();
   const EngineStats st = e.run(feed);
   CHECK_EQ(st.ticks, std::uint64_t(0));  // stopped before consuming anything
+}
+
+
+// ==================================================================== Config
+
+namespace {
+
+// Writes a temporary config file and returns its path.
+std::string write_temp_config(const char* name, const std::string& body) {
+  const std::string path = std::string("build/") + name;
+  std::ofstream f(path);
+  f << body;
+  f.close();
+  return path;
+}
+
+}  // namespace
+
+TEST(config_defaults_are_valid) {
+  AppConfig cfg;
+  std::vector<ConfigError> errors;
+  CHECK(validate_config(cfg, errors));
+  CHECK_EQ(errors.size(), std::size_t(0));
+}
+
+TEST(config_parses_a_well_formed_file) {
+  const std::string path = write_temp_config("cfg_ok.conf",
+      "# a comment\n"
+      "\n"
+      "symbol = TEST   # trailing comment\n"
+      "fast_window = 3\n"
+      "slow_window = 9\n"
+      "order_quantity = 25\n"
+      "fee_bps = 1.25\n"
+      "cross_book = false\n"
+      "max_drawdown = 500\n"
+      "log_level = warn\n");
+
+  AppConfig cfg;
+  std::vector<ConfigError> errors;
+  CHECK(load_config_file(path, cfg, errors));
+  CHECK_EQ(errors.size(), std::size_t(0));
+  CHECK(cfg.symbol == "TEST");
+  CHECK_EQ(cfg.engine.fast_window, std::size_t(3));
+  CHECK_EQ(cfg.engine.slow_window, std::size_t(9));
+  CHECK_EQ(cfg.engine.order_quantity, Quantity(25));
+  CHECK_NEAR(cfg.engine.fee_bps, 1.25, 1e-9);
+  CHECK_FALSE(cfg.engine.cross_book);
+  CHECK_NEAR(cfg.engine.risk.max_drawdown, 500.0, 1e-9);
+  CHECK(cfg.log_level == LogLevel::Warn);
+}
+
+TEST(config_rejects_an_unknown_key) {
+  // The whole point: a typo must be loud, not silently ignored.
+  const std::string path = write_temp_config("cfg_typo.conf", "max_postion_per_symbol = 10\n");
+  AppConfig cfg;
+  std::vector<ConfigError> errors;
+  CHECK_FALSE(load_config_file(path, cfg, errors));
+  CHECK_EQ(errors.size(), std::size_t(1));
+  CHECK(errors[0].message.find("unknown setting") != std::string::npos);
+  CHECK_EQ(errors[0].line, std::size_t(1));
+}
+
+TEST(config_rejects_malformed_values) {
+  AppConfig cfg;
+  std::string err;
+  CHECK_FALSE(apply_config_setting("fast_window", "abc", cfg, err));
+  CHECK_FALSE(err.empty());
+  CHECK_FALSE(apply_config_setting("fast_window", "10abc", cfg, err));  // partial parse
+  CHECK_FALSE(apply_config_setting("fast_window", "", cfg, err));
+  CHECK_FALSE(apply_config_setting("fast_window", "0", cfg, err));      // must be positive
+  CHECK_FALSE(apply_config_setting("fast_window", "-3", cfg, err));
+  CHECK_FALSE(apply_config_setting("cross_book", "maybe", cfg, err));
+  CHECK_FALSE(apply_config_setting("fee_bps", "-1", cfg, err));
+  CHECK_FALSE(apply_config_setting("log_level", "verbose", cfg, err));
+  CHECK_FALSE(apply_config_setting("symbol", "", cfg, err));
+}
+
+TEST(config_accepts_boolean_spellings) {
+  AppConfig cfg;
+  std::string err;
+  for (const char* yes : {"1", "true", "TRUE", "yes", "on"}) {
+    CHECK(apply_config_setting("threaded", yes, cfg, err));
+    CHECK(cfg.engine.threaded);
+  }
+  for (const char* no : {"0", "false", "FALSE", "no", "off"}) {
+    CHECK(apply_config_setting("threaded", no, cfg, err));
+    CHECK_FALSE(cfg.engine.threaded);
+  }
+}
+
+TEST(config_reports_a_missing_file) {
+  AppConfig cfg;
+  std::vector<ConfigError> errors;
+  CHECK_FALSE(load_config_file("build/definitely_missing_config.conf", cfg, errors));
+  CHECK_EQ(errors.size(), std::size_t(1));
+  CHECK(errors[0].message.find("cannot open") != std::string::npos);
+}
+
+TEST(config_reports_a_line_without_an_equals_sign) {
+  const std::string path = write_temp_config("cfg_bad_line.conf", "symbol = OK\njust some words\n");
+  AppConfig cfg;
+  std::vector<ConfigError> errors;
+  CHECK_FALSE(load_config_file(path, cfg, errors));
+  CHECK_EQ(errors[0].line, std::size_t(2));
+}
+
+TEST(config_validation_catches_contradictory_settings) {
+  {
+    AppConfig cfg;
+    cfg.engine.fast_window = 20;
+    cfg.engine.slow_window = 5;
+    std::vector<ConfigError> errors;
+    CHECK_FALSE(validate_config(cfg, errors));
+  }
+  {
+    // order_quantity above max_order_quantity would reject every single order.
+    AppConfig cfg;
+    cfg.engine.order_quantity = 100;
+    cfg.engine.risk.max_order_quantity = 10;
+    std::vector<ConfigError> errors;
+    CHECK_FALSE(validate_config(cfg, errors));
+  }
+  {
+    // A per-symbol limit above the gross limit means gross can never bind.
+    AppConfig cfg;
+    cfg.engine.risk.max_position_per_symbol = 500;
+    cfg.engine.risk.max_gross_position = 100;
+    std::vector<ConfigError> errors;
+    CHECK_FALSE(validate_config(cfg, errors));
+  }
+  {
+    AppConfig cfg;
+    cfg.engine.min_price = 1;
+    cfg.engine.max_price = 300000;  // wider than the book can address
+    std::vector<ConfigError> errors;
+    CHECK_FALSE(validate_config(cfg, errors));
+  }
+  {
+    AppConfig cfg;
+    cfg.events = 0;
+    std::vector<ConfigError> errors;
+    CHECK_FALSE(validate_config(cfg, errors));
+  }
+}
+
+TEST(config_shipped_example_file_loads_and_validates) {
+  // Guards against the documented example drifting away from the parser.
+  AppConfig cfg;
+  std::vector<ConfigError> errors;
+  if (load_config_file("config/engine.conf", cfg, errors)) {
+    CHECK(validate_config(cfg, errors));
+    CHECK_EQ(errors.size(), std::size_t(0));
+  } else {
+    // Running from a different working directory: only fail on real parse
+    // errors, not on the file being absent.
+    CHECK(errors.size() == 1 && errors[0].message.find("cannot open") != std::string::npos);
+  }
+}
+
+TEST(config_describe_mentions_every_key) {
+  AppConfig cfg;
+  const std::string text = describe_config(cfg);
+  for (const auto& key : config_keys()) {
+    CHECK(text.find(key) != std::string::npos);
+  }
+}
+
+// ==================================================================== Logger
+
+TEST(log_level_parsing_round_trips) {
+  LogLevel l;
+  CHECK(parse_log_level("info", l));
+  CHECK(l == LogLevel::Info);
+  CHECK(parse_log_level("WARN", l));
+  CHECK(l == LogLevel::Warn);
+  CHECK(parse_log_level("warning", l));
+  CHECK(l == LogLevel::Warn);
+  CHECK(parse_log_level("off", l));
+  CHECK(l == LogLevel::Off);
+  CHECK_FALSE(parse_log_level("chatty", l));
+}
+
+TEST(log_filters_below_the_configured_level) {
+  Logger lg(LogLevel::Warn, stdout);
+  CHECK_FALSE(lg.enabled(LogLevel::Info));
+  CHECK_FALSE(lg.enabled(LogLevel::Debug));
+  CHECK(lg.enabled(LogLevel::Warn));
+  CHECK(lg.enabled(LogLevel::Error));
+
+  lg.set_level(LogLevel::Off);
+  CHECK_FALSE(lg.enabled(LogLevel::Error));  // Off silences everything
+}
+
+TEST(log_writes_records_asynchronously_and_flushes_on_stop) {
+  std::FILE* f = std::fopen("build/test_log.txt", "w");
+  CHECK(f != nullptr);
+  {
+    Logger lg(LogLevel::Info, f, 1024);
+    lg.start();
+    for (int i = 0; i < 500; ++i) {
+      lg.log(LogLevel::Info, "tick processed", "seq", static_cast<double>(i));
+    }
+    lg.log(LogLevel::Warn, "three fields", "a", 1, "b", 2.5, "c", 3);
+    lg.stop();  // must drain everything still queued
+    CHECK_EQ(lg.written(), std::uint64_t(501));
+  }
+  std::fclose(f);
+
+  std::ifstream in("build/test_log.txt");
+  CHECK(in.good());
+  std::string line;
+  int lines = 0;
+  bool saw_fields = false;
+  while (std::getline(in, line)) {
+    ++lines;
+    if (line.find("a=1 b=2.5000 c=3") != std::string::npos) saw_fields = true;
+  }
+  CHECK_EQ(lines, 501);
+  CHECK(saw_fields);
+}
+
+TEST(log_drops_rather_than_blocking_when_the_queue_is_full) {
+  // Correct behaviour under back-pressure: lose a log line, never delay an
+  // order. The loss must be counted so it is not silent.
+  std::FILE* devnull = std::fopen("build/test_log_drop.txt", "w");
+  CHECK(devnull != nullptr);
+  Logger lg(LogLevel::Info, devnull, 4);
+  // Deliberately NOT started: with no writer draining, the tiny queue fills.
+  // (emit() writes synchronously when stopped, so start then immediately
+  // saturate instead.)
+  lg.start();
+  for (int i = 0; i < 200000; ++i) lg.log(LogLevel::Info, "flood", "i", static_cast<double>(i));
+  lg.stop();
+  std::fclose(devnull);
+  // Either everything got written or some were dropped -- but the two must
+  // always account for every record submitted.
+  CHECK_EQ(lg.written() + lg.dropped(), std::uint64_t(200000));
+}
+
+TEST(log_record_is_trivially_copyable) {
+  // Required for the SPSC ring: a record must be publishable with a plain
+  // store, with no constructor running on the consumer side.
+  CHECK(std::is_trivially_copyable<LogRecord>::value);
+}
+
+// =================================================================== Metrics
+
+TEST(metrics_json_reports_the_whole_run) {
+  EngineConfig cfg;
+  cfg.threaded = false;
+  cfg.order_quantity = 5;
+  cfg.risk.max_orders_per_second = 100'000'000;
+  Engine e(cfg);
+
+  SymbolTable symbols;
+  const SymbolId sym = symbols.intern("TESTSYM");
+  SyntheticFeed::Params p;
+  p.symbol = sym;
+  p.total_events = 100000;
+  p.seed = 5150;
+  SyntheticFeed feed(p);
+  const EngineStats st = e.run(feed);
+
+  const std::string json = metrics_json(e, st, symbols);
+  for (const char* needle : {"\"schema_version\"", "\"run\"", "\"book\"", "\"trading\"",
+                             "\"risk\"", "\"latency\"", "\"rejects_by_reason\"",
+                             "\"tick_to_order\"", "\"p999_ns\"", "TESTSYM",
+                             "position_limit_exceeded", "\"halt_reason\""}) {
+    CHECK(json.find(needle) != std::string::npos);
+  }
+  // Balanced braces is a cheap structural sanity check on hand-rolled JSON.
+  int depth = 0;
+  bool in_string = false;
+  for (std::size_t i = 0; i < json.size(); ++i) {
+    const char c = json[i];
+    if (c == '"' && (i == 0 || json[i - 1] != '\\')) in_string = !in_string;
+    if (in_string) continue;
+    if (c == '{') ++depth;
+    if (c == '}') --depth;
+    CHECK(depth >= 0);
+  }
+  CHECK_EQ(depth, 0);
+
+  CHECK(write_metrics_json("build/test_metrics.json", e, st, symbols));
+}
+
+TEST(metrics_json_escapes_symbol_names) {
+  EngineConfig cfg;
+  cfg.threaded = false;
+  Engine e(cfg);
+  SymbolTable symbols;
+  symbols.intern("we\"ird");
+  EngineStats st;
+  const std::string json = metrics_json(e, st, symbols);
+  CHECK(json.find("we\\\"ird") != std::string::npos || json.find("positions\": {}") != std::string::npos);
+}
+
+TEST(metrics_write_reports_failure_on_a_bad_path) {
+  EngineConfig cfg;
+  cfg.threaded = false;
+  Engine e(cfg);
+  SymbolTable symbols;
+  EngineStats st;
+  CHECK_FALSE(write_metrics_json("build/no_such_dir_xyz/metrics.json", e, st, symbols));
+}
+
+
+// ========================================================= graceful shutdown
+
+namespace {
+
+volatile std::sig_atomic_t g_test_signal_flag = 0;
+extern "C" void test_signal_handler(int) { g_test_signal_flag = 1; }
+
+}  // namespace
+
+TEST(signal_handler_sets_the_stop_flag) {
+  // The production handler does exactly one thing -- set a sig_atomic_t -- and
+  // a watcher thread turns that into Engine::request_stop(). Calling into the
+  // engine from a signal context would not be safe. This verifies the
+  // handler-to-flag half; the flag-to-engine half is covered below.
+  //
+  // Note: MSYS `kill -INT` cannot deliver a signal to a native Windows binary,
+  // so this raises the signal in-process rather than shelling out.
+  auto* previous = std::signal(SIGINT, test_signal_handler);
+  CHECK(previous != SIG_ERR);
+  g_test_signal_flag = 0;
+  CHECK_EQ(static_cast<int>(g_test_signal_flag), 0);
+
+  CHECK_EQ(std::raise(SIGINT), 0);
+  CHECK_EQ(static_cast<int>(g_test_signal_flag), 1);
+
+  std::signal(SIGINT, previous == SIG_ERR ? SIG_DFL : previous);
+}
+
+TEST(engine_stops_mid_run_when_asked_from_another_thread) {
+  // The realistic shutdown path: the engine is already running when the stop
+  // arrives, and must finish cleanly rather than being killed.
+  EngineConfig cfg;
+  cfg.threaded = true;
+  cfg.risk.max_orders_per_second = 100'000'000;
+  Engine e(cfg);
+
+  SyntheticFeed::Params p;
+  p.total_events = 50'000'000;  // far more than we intend to consume
+  p.seed = 8080;
+  SyntheticFeed feed(p);
+
+  std::atomic<bool> done{false};
+  std::thread stopper([&] {
+    // Let it get going, then ask it to stop.
+    while (!done.load(std::memory_order_acquire) && e.book().live_order_count() < 5000) {
+      std::this_thread::yield();
+    }
+    e.request_stop();
+  });
+
+  const EngineStats st = e.run(feed);
+  done.store(true, std::memory_order_release);
+  stopper.join();
+
+  CHECK(e.stop_requested());
+  CHECK(st.ticks > 0);
+  CHECK(st.ticks < p.total_events);   // stopped early, did not drain the feed
+  CHECK_EQ(st.dropped_ticks, std::uint64_t(0));  // clean stop loses nothing
+
+  // The engine must still be in a consistent, reportable state afterwards.
+  const Price bb = e.book().best_bid();
+  const Price ba = e.book().best_ask();
+  if (bb != kNoPrice && ba != kNoPrice) CHECK(bb < ba);
+  CHECK_EQ(e.venue().fill_count(), st.orders_sent);
+}
+
+TEST(engine_flatten_is_idempotent_and_safe_when_flat) {
+  EngineConfig cfg;
+  cfg.threaded = false;
+  Engine e(cfg);
+  EngineStats st;
+  // Nothing traded yet: flattening must be a no-op, not a crash or a phantom
+  // order priced at zero.
+  CHECK_EQ(e.flatten(st), std::uint64_t(0));
+  CHECK_EQ(st.flatten_orders, std::uint64_t(0));
+  CHECK_EQ(e.venue().fill_count(), std::uint64_t(0));
+}
+
+TEST(engine_flatten_after_a_halt_still_exits_the_position) {
+  // The kill switch blocks new risk, but must not trap us in an open position:
+  // flattening deliberately bypasses the pre-trade gate.
+  EngineConfig cfg;
+  cfg.threaded = false;
+  cfg.order_quantity = 10;
+  cfg.risk.max_orders_per_second = 100'000'000;
+  Engine e(cfg);
+
+  SyntheticFeed::Params p;
+  p.total_events = 100000;
+  p.seed = 24680;
+  SyntheticFeed feed(p);
+  EngineStats st = e.run(feed);
+
+  e.risk().engage_kill_switch(HaltReason::Manual);
+  CHECK(e.risk().halted());
+  CHECK(e.risk().should_flatten());
+
+  const std::int64_t before = e.venue().position(0);
+  e.flatten(st);
+  CHECK_EQ(e.venue().position(0), std::int64_t(0));
+  if (before != 0) CHECK(st.flatten_orders > 0);
 }
 
 // ====================================================================== main

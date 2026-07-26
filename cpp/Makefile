@@ -83,6 +83,55 @@ run: $(ENGINE_BIN)
 	./$(ENGINE_BIN)
 
 clean:
-	rm -rf $(BUILD)
+	rm -rf $(BUILD) build-asan build-ubsan build-tsan build-hardened
+
+# ---------------------------------------------------------------- sanitizers
+#
+# ASan/UBSan/TSan need libasan/libubsan/libtsan, which the MSYS2/MinGW
+# toolchain does NOT ship -- `-fsanitize=address` fails at link time with
+# "cannot find -lasan" on Windows. These targets are therefore for Linux/CI
+# (where CI does run them); `make hardened` below is the equivalent that
+# actually works on MinGW.
+#
+# Each sanitizer builds into its own directory so the objects never mix with
+# the optimised build.
+
+SAN_CXXFLAGS := -std=$(CXXSTD) -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Wpedantic -Werror -Iinclude -Itests
+SAN_SRCS := $(LIB_SRCS) tests/tests_main.cpp
+
+.PHONY: asan ubsan tsan hardened sanitizers
+
+asan:
+	@mkdir -p build-asan
+	$(CXX) $(SAN_CXXFLAGS) -fsanitize=address -fsanitize=undefined $(SAN_SRCS) -o build-asan/hft_tests $(LDLIBS)
+	ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 ./build-asan/hft_tests
+
+ubsan:
+	@mkdir -p build-ubsan
+	$(CXX) $(SAN_CXXFLAGS) -fsanitize=undefined -fno-sanitize-recover=all $(SAN_SRCS) -o build-ubsan/hft_tests $(LDLIBS)
+	./build-ubsan/hft_tests
+
+tsan:
+	@mkdir -p build-tsan
+	$(CXX) $(SAN_CXXFLAGS) -fsanitize=thread $(SAN_SRCS) -o build-tsan/hft_tests $(LDLIBS)
+	TSAN_OPTIONS=halt_on_error=1 ./build-tsan/hft_tests
+
+sanitizers: asan ubsan tsan
+
+# Works everywhere, including MinGW, because none of it needs a sanitizer
+# runtime library:
+#   -fsanitize-undefined-trap-on-error  turns UB checks into a trap instruction
+#   -D_GLIBCXX_DEBUG                    bounds-checks every std:: container
+#   -D_GLIBCXX_ASSERTIONS               enables libstdc++ precondition checks
+#   -fstack-protector-strong            catches stack smashing
+# A failure here aborts the process rather than printing a nice report, so run
+# it under a debugger if something trips.
+hardened:
+	@mkdir -p build-hardened
+	$(CXX) -std=$(CXXSTD) -O1 -g -Wall -Wextra -Wpedantic -Werror -Iinclude -Itests \
+	  -fsanitize=undefined -fsanitize-undefined-trap-on-error \
+	  -D_GLIBCXX_DEBUG -D_GLIBCXX_ASSERTIONS -fstack-protector-strong \
+	  $(SAN_SRCS) -o build-hardened/hft_tests $(LDFLAGS) $(LDLIBS)
+	./build-hardened/hft_tests
 
 -include $(wildcard $(BUILD)/obj/*.d)
