@@ -78,6 +78,7 @@ const std::vector<std::string>& config_keys() {
       "feed_require_sequence", "feed_halt_on_gap", "feed_tolerated_gap", "feed_stale_ms",
       // durability
       "journal_path", "journal_sync", "journal_sync_interval", "allow_unclean_start",
+      "venue_state_path",
       // output / ops
       "out_dir", "depth_levels", "log_level", "flatten_on_exit",
   };
@@ -276,6 +277,8 @@ bool apply_config_setting(const std::string& key, const std::string& value, AppC
   } else if (key == "allow_unclean_start") {
     if (!need_bool("allow_unclean_start")) return false;
     cfg.allow_unclean_start = b;
+  } else if (key == "venue_state_path") {
+    cfg.venue_state_path = value;
 
     // --- output / ops -------------------------------------------------------
   } else if (key == "out_dir") {
@@ -426,6 +429,9 @@ std::string describe_config(const AppConfig& cfg) {
      << "  journal_sync            = " << to_string(cfg.journal_sync) << "\n"
      << "  journal_sync_interval   = " << cfg.journal_sync_interval << "\n"
      << "  allow_unclean_start     = " << (cfg.allow_unclean_start ? "true" : "false") << "\n"
+     << "  venue_state_path        = "
+     << (cfg.venue_state_path.empty() ? "(none -- the venue cannot be asked)" : cfg.venue_state_path)
+     << "\n"
      << "  out_dir                 = " << (cfg.out_dir.empty() ? "(none)" : cfg.out_dir) << "\n"
      << "  depth_levels            = " << cfg.depth_levels << "\n"
      << "  log_level               = " << to_string(cfg.log_level) << "\n"

@@ -148,6 +148,7 @@ std::string metrics_json(const Engine& engine, const EngineStats& stats,
      << "    \"cancel_rejected\": " << oms.cancel_rejected << ",\n"
      << "    \"venue_rejected\": " << oms.venue_rejected << ",\n"
      << "    \"expired\": " << oms.expired << ",\n"
+     << "    \"adopted\": " << oms.adopted << ",\n"
      << "    \"working\": " << engine.oms().open_count() << ",\n"
      << "    \"gross_working_quantity\": " << engine.oms().gross_working_exposure() << ",\n"
      << "    \"breaks\": " << oms.breaks() << ",\n"

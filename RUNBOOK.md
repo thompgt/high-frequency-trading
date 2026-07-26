@@ -46,6 +46,7 @@ error: refusing to start -- the previous session left state that needs reconcili
   unclean shutdown : yes
   open orders      : 3 (may still be live at the venue)
   corrupt records  : 0
+  venue state      : not available
 ```
 
 **Do not just add `--allow-unclean-start`.** This is the one exit code that
@@ -83,17 +84,61 @@ OPEN ORDERS         : 3 -- these may still be live at the venue; reconcile befor
 | `PARTIALLY_FILLED` | Acknowledged, partly done, remainder still working. | Same, and expect the position to be larger than the journal shows if it filled further after the crash. |
 | `PENDING_NEW` | **The worst case.** We sent it and never heard back. It may be live, or it may have died on the wire. | Query the venue by client order id. Never assume either way. |
 
-**3. Reconcile against the venue.** Compare the recovered position and open
-orders with the venue's drop copy or order-status API. This step is manual
-today — see the README's "what it would take" list; automated venue-side
-reconciliation is a known gap, not an oversight.
+**3. Reconcile against the venue.** Write down what the venue reports — from
+its drop copy, its order-status API, or its terminal — into a file, one record
+per line:
 
-**4. Only then restart:**
+```
+# symbol is the instrument name; prices are in ticks, as everywhere else
+ORDER,<cl_ord_id>,<venue_order_id>,<symbol>,<BUY|SELL>,<price>,<qty>,<filled>,<leaves>
+POSITION,<symbol>,<signed position>
+
+ORDER,8871,55210,SYNTH,SELL,10083,400,0,400
+POSITION,SYNTH,1200
+```
+
+List **every** order the venue is resting and **every** position it holds, not
+just the ones you expect. An order you leave out is an order the engine will
+report as an orphan, which is the correct and safe direction to be wrong in.
+
+**4. Restart with it, and let the engine do the comparison:**
+
+```bash
+./build/hft_engine --config config/engine.conf --journal /var/lib/hft/engine.jrn \
+                   --venue-state /var/lib/hft/venue.txt
+```
+
+If everything agrees, the engine starts, **adopts** the orders that are still
+resting so they count toward every risk limit, and says so:
+
+```
+--- reconciliation against /var/lib/hft/venue.txt ---
+venue state    : available
+open orders    : 3 ours, 3 theirs, 3 agreed
+discrepancies  : 0
+reconciled clean against the venue: 3 order(s) still resting, adopting them.
+```
+
+If anything disagrees, it exits 6 again with the disagreements named:
+
+| Break | What it means | What to do |
+|---|---|---|
+| `ORPHAN_AT_VENUE` | **The worst one.** The venue is resting an order we have no record of. No limit sees it and no cancel of ours reaches it. | Cancel it at the venue by hand, then re-pull the venue state. |
+| `MISSING_AT_VENUE` | We think an order is working; the venue is not resting it. It either never arrived or is already done. | Check the venue's fill history — if it filled, the position line is what matters. |
+| `QUANTITY_MISMATCH` | Both sides know the order, the leaves differ. A fill report was lost. | Trust the venue. Correct the position line and re-pull. |
+| `TERMS_MISMATCH` | The same id refers to orders with different price or side. | Stop. This means an id was reused; do not restart until you know why. |
+| `POSITION_MISMATCH` | Our replayed position is not the venue's. | The venue is the authority. Investigate before quoting; a wrong starting position makes every subsequent limit wrong. |
+
+**5. The override is a last resort:**
 
 ```bash
 ./build/hft_engine --config config/engine.conf --journal /var/lib/hft/engine.jrn \
                    --allow-unclean-start
 ```
+
+`--allow-unclean-start` **skips** the check rather than passing it. Use it only
+when you have reconciled by hand and are certain, and record why in the
+incident log.
 
 ### `torn tail` versus `CORRUPT records`
 
@@ -234,6 +279,7 @@ From `metrics.json` in `--out-dir`. Ranked by how quickly you want to know.
 | `feed.stale_events` | `> 0` | The feed went quiet. |
 | `orders.expired` | `> 0` | Orders went unacknowledged past the timeout — venue latency or a dropped session. |
 | `run.dropped_ticks` | `> 0` | The engine could not keep up with its own feed. |
+| `orders.adopted` | `> 0` | This session inherited live orders from the last one. Expected after a reconciled restart; unexplained otherwise. |
 | `risk.rejects_by_reason.*` | any sustained non-zero | Each reason names a specific misconfiguration or strategy bug. |
 
 **Watch the trend, do not alarm:**

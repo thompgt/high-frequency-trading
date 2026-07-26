@@ -121,6 +121,59 @@ jobs:
           ./build/hft_engine --events 1000 --journal out/ci.jrn \
             --allow-unclean-start --set max_orders_per_second=100000000 > /dev/null
 
+      - name: Reconciliation against the venue gates an unclean restart
+        working-directory: cpp
+        run: |
+          mkdir -p out
+          rm -f out/recon.jrn
+          ./build/hft_engine --events 60000 --journal out/recon.jrn \
+            --set max_orders_per_second=100000000 > /dev/null
+          # Crash: lose the end-of-session marker and the last record.
+          python3 -c "import os; p='out/recon.jrn'; os.truncate(p, os.path.getsize(p)-232)"
+
+          # What did we leave behind? Build the venue's answer from it.
+          ./build/hft_engine --recover out/recon.jrn > out/recon.txt
+          python3 - <<'EOF'
+          import re
+          text = open('out/recon.txt').read()
+          order = re.search(r"cl_ord_id=(\d+) symbol=(\d+) (BUY|SELL) (\d+) @ ([\d.]+)", text)
+          pos = re.search(r"position symbol 0\s+: (-?\d+)", text)
+          assert order, text
+          cl, sym, side, qty, px = order.groups()
+          px = int(round(float(px) * 100))
+          with open('out/venue_ok.txt', 'w') as f:
+              f.write("ORDER,%s,0,SYNTH,%s,%d,%s,0,%s\n" % (cl, side, px, qty, qty))
+              f.write("POSITION,SYNTH,%s\n" % (pos.group(1) if pos else "0"))
+          # The same file, plus an order the venue is resting that we never sent.
+          with open('out/venue_orphan.txt', 'w') as f:
+              f.write(open('out/venue_ok.txt').read())
+              f.write("ORDER,999999,0,SYNTH,BUY,10000,50,0,50\n")
+          EOF
+
+          # An agreeing venue resolves the unclean shutdown: the engine starts,
+          # and takes over the order that is still resting rather than leaving
+          # it untracked.
+          ./build/hft_engine --events 1000 --journal out/recon.jrn \
+            --venue-state out/venue_ok.txt --out-dir out \
+            --set max_orders_per_second=100000000 > out/recon_ok.txt 2>&1
+          grep -q "reconciled clean against the venue" out/recon_ok.txt
+          python3 -c "
+          import json
+          m = json.load(open('out/metrics.json'))
+          assert m['orders']['adopted'] >= 1, m['orders']
+          "
+
+          # An order live at the venue and unknown to us is the one break that
+          # must never be startable through.
+          python3 -c "import os; p='out/recon.jrn'; os.truncate(p, os.path.getsize(p)-232)"
+          set +e
+          ./build/hft_engine --events 1000 --journal out/recon.jrn \
+            --venue-state out/venue_orphan.txt > out/recon_bad.txt 2>&1
+          code=$?
+          set -e
+          test "$code" -eq 6
+          grep -q "ORPHAN_AT_VENUE" out/recon_bad.txt
+
       - name: A gapped feed must stop trading
         working-directory: cpp
         run: |

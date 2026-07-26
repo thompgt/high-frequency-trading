@@ -31,6 +31,7 @@
 #include "hft/feed.hpp"
 #include "hft/log.hpp"
 #include "hft/metrics.hpp"
+#include "hft/reconcile.hpp"
 #include "hft/symbol_table.hpp"
 
 using namespace hft;
@@ -70,6 +71,7 @@ void usage(const char* argv0) {
       "  --replay-events N     rows to write with --write-replay (default 200000)\n"
       "  --journal FILE        append every order and fill here, for crash recovery\n"
       "  --recover FILE        replay a journal, print what it recovers, and exit\n"
+      "  --venue-state FILE    what the venue reports it holds, to reconcile against\n"
       "  --allow-unclean-start start even if the last session did not exit cleanly\n"
       "  --out-dir DIR         write metrics.json and CSVs here\n"
       "  --inline              run single-threaded (no ring hand-off)\n"
@@ -132,6 +134,8 @@ bool parse_cli(int argc, char** argv, AppConfig& cfg, std::string& config_path,
       overrides.emplace_back("journal_path", need("--journal"));
     } else if (a == "--recover") {
       recover_path = need("--recover");
+    } else if (a == "--venue-state") {
+      overrides.emplace_back("venue_state_path", need("--venue-state"));
     } else if (a == "--allow-unclean-start") {
       overrides.emplace_back("allow_unclean_start", "true");
     } else if (a == "--write-replay") {
@@ -306,6 +310,7 @@ int run(int argc, char** argv) {
   // crash into a loss.
   Journal journal;
   ClOrdId recovered_next_cl_ord_id = 1;
+  ReconciliationReport recon;
   if (!cfg.journal_path.empty()) {
     const RecoveredState recovered = recover_from_journal(cfg.journal_path);
     recovered_next_cl_ord_id = recovered.next_cl_ord_id + 1;
@@ -325,20 +330,48 @@ int run(int argc, char** argv) {
     const bool needs_attention =
         (recovered.records_read > 0 && !recovered.clean_shutdown) ||
         !recovered.open_orders.empty() || recovered.corrupt_records > 0;
-    if (needs_attention && !cfg.allow_unclean_start) {
+
+    // If the venue can be asked, ask it. A clean reconciliation against the
+    // venue is a stronger statement than a clean shutdown: it says our view
+    // and the authority's view agree *now*, which is the only thing that
+    // actually licenses quoting. It is also the only way to find an order that
+    // is resting at the venue and missing from our journal entirely.
+    if (needs_attention && !cfg.venue_state_path.empty()) {
+      FileVenueStateSource source(cfg.venue_state_path, &cfg.engine.instruments);
+      VenueSnapshot snapshot;
+      std::string fetch_error;
+      const bool fetched = source.fetch(snapshot, fetch_error);
+      recon = reconcile(recovered, snapshot);
+      if (!fetched) recon.error = fetch_error;
+      std::printf("\n--- reconciliation against %s ---\n%s", cfg.venue_state_path.c_str(),
+                  recon.summary().c_str());
+    }
+
+    // Fail closed. An unclean shutdown or a possibly-live order is a state a
+    // human has to sign off on -- unless the venue has just told us there is
+    // nothing to sign off on.
+    if (needs_attention && !recon.clean() && !cfg.allow_unclean_start) {
       std::fprintf(stderr,
                    "\nerror: refusing to start -- the previous session left state that needs "
                    "reconciling:\n"
                    "  unclean shutdown : %s\n"
                    "  open orders      : %zu (may still be live at the venue)\n"
                    "  corrupt records  : %llu\n"
-                   "Reconcile against the venue, then restart with "
-                   "--allow-unclean-start.\n",
+                   "  venue state      : %s\n"
+                   "Reconcile against the venue (--venue-state FILE), then restart. "
+                   "--allow-unclean-start overrides this, and skips the check rather "
+                   "than passing it.\n",
                    recovered.clean_shutdown ? "no" : "yes", recovered.open_orders.size(),
-                   (unsigned long long)recovered.corrupt_records);
+                   (unsigned long long)recovered.corrupt_records,
+                   recon.venue_available ? "disagrees (see above)" : "not available");
       HFT_ERROR("refusing to start after an unclean shutdown");
       log.stop();
       return kExitUnclean;
+    }
+    if (recon.clean() && needs_attention) {
+      std::printf("\nreconciled clean against the venue: %zu order(s) still resting, "
+                  "adopting them.\n",
+                  recon.agreed_open.size());
     }
 
     Journal::Config jcfg;
@@ -390,6 +423,37 @@ int run(int argc, char** argv) {
     // would make the journal itself unreplayable, since one id would refer to
     // two different orders.
     engine->oms().set_next_id(recovered_next_cl_ord_id);
+
+    // Orders the venue confirmed are still resting become tracked exposure
+    // before the first tick is processed. An order that is live but untracked
+    // is invisible to every risk limit, so this has to happen before anything
+    // can quote -- not opportunistically once the first report arrives.
+    std::size_t adopted = 0;
+    for (const auto& vo : recon.agreed_open) {
+      OrderRecord rec;
+      rec.cl_ord_id = vo.cl_ord_id;
+      rec.venue_order_id = vo.venue_order_id;
+      rec.symbol = vo.symbol;
+      rec.side = vo.side;
+      rec.price = vo.price;
+      rec.quantity = vo.quantity;
+      rec.filled = vo.filled;
+      rec.leaves = vo.leaves;
+      rec.state = vo.filled > 0 ? OrderState::PartiallyFilled : OrderState::New;
+      if (engine->oms().adopt(rec, now_ns()) != 0) ++adopted;
+    }
+    if (adopted != recon.agreed_open.size()) {
+      // Failing to adopt is not a warning. It leaves an order live at the
+      // venue that this process cannot see, which is the exact condition the
+      // reconciliation exists to prevent.
+      std::fprintf(stderr,
+                   "\nerror: adopted only %zu of %zu order(s) still resting at the venue. "
+                   "The remainder would be live and untracked.\n",
+                   adopted, recon.agreed_open.size());
+      HFT_ERROR("could not adopt every order resting at the venue");
+      log.stop();
+      return kExitUnclean;
+    }
   }
 
   // --- signals -------------------------------------------------------------

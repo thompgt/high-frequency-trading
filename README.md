@@ -43,6 +43,9 @@ prototyping tool, not a feed.
                                                              │
                                                              ▼
                                                           Journal ──▶ recovery
+                                                                          │
+                                          venue drop copy ──▶ reconcile ◀─┘
+                                                    (agree? adopt. differ? stop.)
 ```
 
 Every stage is behind an interface (`MarketDataSource`, `ExecutionVenue`,
@@ -59,6 +62,7 @@ touching anything downstream.
 | **Pre-trade risk** | `risk.hpp` | Fat-finger, price collar, inventory (including in-flight), throttle, drawdown kill switch. Fails closed. |
 | **Feed health** | `feed_health.hpp` | Sequence validation, duplicate/reorder rejection, staleness watchdog. |
 | **Durability** | `journal.hpp` | CRC32'd append-only journal; recovery rebuilds position and open orders after a crash. |
+| **Reconciliation** | `reconcile.hpp` | Compares what we recovered against what the venue says it holds, and names every disagreement. |
 | **Ring buffer** | `ring_buffer.hpp` | Lock-free SPSC, cache-line padded, no false sharing. |
 | **Latency** | `latency.hpp` | HdrHistogram-style buckets, allocation-free on the record path. |
 | **Logging** | `log.hpp` | Async: no formatting and no I/O on the tick path. Drops rather than blocks. |
@@ -83,7 +87,15 @@ channel, so it does the honest half and halts.
 can exist at the venue, and every execution report before it is applied. On
 restart, recovery runs before anything can trade. If the last session did not
 exit cleanly or left orders that may still be live, the engine **refuses to
-start** (exit code 6) until a human reconciles.
+start** (exit code 6) until it can reconcile against the venue.
+
+Recovery alone only answers "what did *we* last write down?". The venue is the
+authority, so a restart can be handed what the venue reports
+(`--venue-state FILE`) and the two are compared. An order the venue is resting
+that we know nothing about is the break that matters: it is live, no limit
+sees it, and no cancel of ours can reach it. Orders both sides agree on are
+adopted into the OMS before the first tick, so they are risk the engine can
+see. Everything else stops the start.
 
 **4. Divergence from the venue is counted, not swallowed.** Unknown order ids,
 duplicate acks, illegal transitions and overfills are all counted as
@@ -119,6 +131,9 @@ ctest --test-dir cpp/build --output-on-failure
 
 # Ask a journal what the last session left behind.
 ./build/hft_engine --recover out/engine.jrn
+
+# Restart after a crash, reconciling against what the venue reports it holds.
+./build/hft_engine --journal out/engine.jrn --venue-state out/venue.txt
 
 # Capture a replay file, then replay it deterministically.
 ./build/hft_engine --write-replay out/replay.csv --replay-events 200000
@@ -176,7 +191,7 @@ from a crash, and which metrics to alarm on.
 
 ```bash
 cd cpp
-make test          # 217 unit tests
+make test          # 239 unit tests
 make hardened      # UBSan trap mode + _GLIBCXX_DEBUG, works on MinGW
 make asan          # ASan + UBSan (Linux; MinGW ships no sanitizer runtime)
 make tsan
@@ -232,8 +247,10 @@ Honestly stated, in order:
 2. **A market data snapshot channel.** Today a gap halts the engine because
    there is no way to rebuild the book. With snapshot recovery it could
    re-synchronise and carry on.
-3. **Venue-side reconciliation on startup.** Recovery currently reports what
-   *we* think is open. It should then ask the venue and compare.
+3. **A live order-status query.** Startup reconciliation exists and gates the
+   restart, but with no order-entry session the venue's side has to be handed
+   in as a file. With connectivity it becomes an order-status request, and the
+   same comparison runs unchanged.
 4. **A real strategy.** The moving-average crossover is a placeholder that
    exists to exercise the pipeline.
 5. **Hardware and tuning.** Core pinning, isolated CPUs, huge pages, kernel

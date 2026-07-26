@@ -39,6 +39,11 @@ struct AppConfig {
   // down cleanly or left orders that may still be live at the venue. Default
   // false: fail closed and make a human look.
   bool allow_unclean_start = false;
+  // What the venue says it is holding for us, used to reconcile at startup.
+  // With a session this would be an order-status request; with none, it is a
+  // file an operator produced from the venue's own records. Empty means we
+  // cannot ask -- which is not the same as the venue having nothing open.
+  std::string venue_state_path;
 
   // Output
   std::string out_dir;
