@@ -14,6 +14,7 @@ Engine::Engine(EngineConfig config)
                                 config.cross_book ? &book_ : nullptr}),
       risk_(config.risk),
       oms_(config.oms),
+      feed_(config.feed_health),
       ring_(config.ring_capacity) {
   trade_scratch_.reserve(256);
   venue_.set_record_curve(config.record_curve);
@@ -87,6 +88,30 @@ Fill Engine::dispatch(const Order& order, Price reference_price, ClOrdId cl_ord_
 
 void Engine::process(const Tick& tick, EngineStats& stats) {
   ++stats.ticks;
+
+  // --- stage 0: is this message usable at all? -----------------------------
+  // Everything downstream assumes the book reflects the exchange's book, and
+  // that assumption is only as good as the message stream that built it.
+  const FeedStatus status = feed_.on_tick(tick, tick.ingest_ts_ns);
+  if (status == FeedStatus::Duplicate || status == FeedStatus::Reordered) {
+    // A duplicate would double-apply an add; a reordered message would undo
+    // newer state. Both corrupt the book, so neither is applied.
+    ++stats.stale_messages;
+    return;
+  }
+  if (feed_.faulted()) {
+    // We know the book is missing updates. It will keep accepting messages so
+    // the depth stays roughly current for the operator's benefit, but nothing
+    // trades off it until the session is explicitly resynchronised.
+    if (!risk_.halted()) {
+      risk_.engage_kill_switch(HaltReason::Manual);
+      if (journal_ != nullptr) {
+        journal_->record_halt(static_cast<std::uint8_t>(HaltReason::Manual), tick.ingest_ts_ns);
+      }
+    }
+    stats.halted = true;
+    ++stats.ticks_while_faulted;
+  }
 
   // --- stage 1: apply the message to the book ------------------------------
   const Nanos book_start = now_ns();
@@ -279,6 +304,18 @@ EngineStats Engine::run_threaded(MarketDataSource& feed) {
     }
     if (producer_done.load(std::memory_order_acquire) && ring_.empty_approx()) break;
     if (stop_requested() && producer_done.load(std::memory_order_acquire)) break;
+
+    // Idle is the only place a silent feed can be noticed: a feed that has
+    // stopped sending will never call process() to say so. A frozen book and a
+    // quiet market are indistinguishable from inside, and only one of them is
+    // safe to quote against.
+    if (feed_.check_stale(now_ns()) && !risk_.halted()) {
+      risk_.engage_kill_switch(HaltReason::Manual);
+      stats.halted = true;
+      if (journal_ != nullptr) {
+        journal_->record_halt(static_cast<std::uint8_t>(HaltReason::Manual), now_ns());
+      }
+    }
     std::this_thread::yield();
   }
 

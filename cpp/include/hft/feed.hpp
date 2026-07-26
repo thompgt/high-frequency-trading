@@ -88,7 +88,9 @@ class SyntheticFeed : public MarketDataSource {
 // Replays a CSV file produced by SyntheticFeed::write_replay_csv (or by any
 // capture tool emitting the same columns).
 //
-// Columns: symbol,type,side,price,quantity,order_id,source_ts_ns
+// Columns: symbol,type,side,price,quantity,order_id,source_ts_ns,sequence
+// The trailing sequence column is optional; captures written before it existed
+// replay with sequence 0.
 class CsvReplayFeed : public MarketDataSource {
  public:
   explicit CsvReplayFeed(const std::string& path);

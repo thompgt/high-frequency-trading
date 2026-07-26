@@ -12,6 +12,7 @@
 
 #include "hft/execution.hpp"
 #include "hft/feed.hpp"
+#include "hft/feed_health.hpp"
 #include "hft/journal.hpp"
 #include "hft/latency.hpp"
 #include "hft/oms.hpp"
@@ -45,6 +46,9 @@ struct EngineConfig {
   // Order lifecycle tracking. Its exposure feeds the risk gate, so an order
   // that cannot be tracked is an order that does not get sent.
   OrderManager::Config oms;
+  // Market data session validation. A gap means the book is missing updates
+  // and is therefore wrong; by default that stops trading.
+  FeedHealthConfig feed_health;
 };
 
 struct EngineStats {
@@ -69,6 +73,11 @@ struct EngineStats {
   // that cannot record what it did cannot be recovered after a crash, so it
   // halts rather than trading blind.
   std::uint64_t journal_failures = 0;
+  // Messages dropped because the feed said they were stale or duplicated.
+  // Applying either would corrupt the book.
+  std::uint64_t stale_messages = 0;
+  // Ticks not traded on because the feed session was faulted.
+  std::uint64_t ticks_while_faulted = 0;
   bool halted = false;
   Nanos wall_ns = 0;
 
@@ -93,6 +102,8 @@ class Engine {
   const RiskManager& risk() const { return risk_; }
   OrderManager& oms() { return oms_; }
   const OrderManager& oms() const { return oms_; }
+  FeedMonitor& feed_monitor() { return feed_; }
+  const FeedMonitor& feed_monitor() const { return feed_; }
   LatencyRecorder& latency() { return latency_; }
   const LatencyRecorder& latency() const { return latency_; }
   const EngineConfig& config() const { return cfg_; }
@@ -139,6 +150,7 @@ class Engine {
   PaperVenue venue_;
   RiskManager risk_;
   OrderManager oms_;
+  FeedMonitor feed_;
   LatencyRecorder latency_;
   SpscRingBuffer<Tick> ring_;
   std::vector<Trade> trade_scratch_;  // reused so matching never allocates

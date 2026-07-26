@@ -116,6 +116,24 @@ std::string metrics_json(const Engine& engine, const EngineStats& stats,
   }
   os << "}\n  },\n";
 
+  // --- market data session --------------------------------------------------
+  // `faulted` and a non-zero `gaps` both mean the book was built from an
+  // incomplete stream and cannot be trusted.
+  const FeedHealthStats& feed = engine.feed_monitor().stats();
+  os << "  \"feed\": {\n"
+     << "    \"messages\": " << feed.messages << ",\n"
+     << "    \"gaps\": " << feed.gaps << ",\n"
+     << "    \"messages_missing\": " << feed.messages_missing << ",\n"
+     << "    \"largest_gap\": " << feed.largest_gap << ",\n"
+     << "    \"duplicates\": " << feed.duplicates << ",\n"
+     << "    \"reordered\": " << feed.reordered << ",\n"
+     << "    \"unsequenced\": " << feed.unsequenced << ",\n"
+     << "    \"stale_events\": " << feed.stale_events << ",\n"
+     << "    \"dropped_messages\": " << stats.stale_messages << ",\n"
+     << "    \"ticks_while_faulted\": " << stats.ticks_while_faulted << ",\n"
+     << "    \"faulted\": " << (engine.feed_monitor().faulted() ? "true" : "false") << "\n"
+     << "  },\n";
+
   // --- order lifecycle ------------------------------------------------------
   // `breaks` is the number to alert on: it is non-zero only when our view of
   // an order and the venue's have diverged.

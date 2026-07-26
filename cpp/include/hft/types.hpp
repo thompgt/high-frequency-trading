@@ -60,6 +60,12 @@ struct Tick {
   OrderId order_id = 0;
   Nanos source_ts_ns = 0;  // timestamp stamped by the feed/exchange
   Nanos ingest_ts_ns = 0;  // timestamp stamped when we received it
+  // Per-channel message sequence number, assigned by the feed. Every real
+  // market data protocol carries one, and it is the only way to know that the
+  // book you have built is the book the exchange has: a missed message leaves
+  // you with a book that is silently, permanently wrong. Zero means the feed
+  // does not sequence its messages.
+  std::uint64_t sequence = 0;
 };
 
 // Emitted by a Strategy when it wants to trade.

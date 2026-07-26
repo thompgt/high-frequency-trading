@@ -430,6 +430,17 @@ int run(int argc, char** argv) {
   std::printf("wall time           : %.3f s\n", (double)stats.wall_ns / 1e9);
   std::printf("throughput          : %.0f ticks/sec\n", stats.ticks_per_second());
 
+  std::printf("\n--- market data session ---\n%s", engine->feed_monitor().summary().c_str());
+  if (engine->feed_monitor().stats().gaps > 0) {
+    std::fprintf(stderr,
+                 "warning: %llu sequence gap(s), %llu message(s) lost -- the book was built "
+                 "from an incomplete stream\n",
+                 (unsigned long long)engine->feed_monitor().stats().gaps,
+                 (unsigned long long)engine->feed_monitor().stats().messages_missing);
+    HFT_ERROR("market data gaps",
+              "gaps", static_cast<double>(engine->feed_monitor().stats().gaps));
+  }
+
   std::printf("\n--- orders ---\n%s", engine->oms().summary().c_str());
   if (engine->oms().stats().breaks() > 0) {
     // A break means our record of an order and the venue's have diverged.

@@ -56,6 +56,9 @@ bool SyntheticFeed::next(Tick& out) {
   out.side = side;
   out.quantity = qty;
   out.source_ts_ns = now_ns();
+  // Sequence numbers start at 1, so that 0 keeps its meaning of "this feed does
+  // not sequence" rather than colliding with a real first message.
+  out.sequence = static_cast<std::uint64_t>(emitted_);
 
   if (roll < params_.pct_add || live_ids_.empty()) {
     // Passive add: buys below fair value, sells above, biased toward the touch
@@ -93,13 +96,14 @@ bool SyntheticFeed::write_replay_csv(const std::string& path, Params params, std
   SyntheticFeed feed(params);
   std::ofstream f(path);
   if (!f) return false;
-  f << "symbol,type,side,price,quantity,order_id,source_ts_ns\n";
+  f << "symbol,type,side,price,quantity,order_id,source_ts_ns,sequence\n";
 
   Tick t;
   std::size_t n = 0;
   while (n < count && feed.next(t)) {
     f << t.symbol << ',' << static_cast<int>(t.type) << ',' << static_cast<int>(t.side) << ','
-      << t.price << ',' << t.quantity << ',' << t.order_id << ',' << t.source_ts_ns << '\n';
+      << t.price << ',' << t.quantity << ',' << t.order_id << ',' << t.source_ts_ns << ','
+      << t.sequence << '\n';
     ++n;
   }
   return static_cast<bool>(f);
@@ -126,11 +130,16 @@ CsvReplayFeed::CsvReplayFeed(const std::string& path) : path_(path) {
   auto parse = [&](const std::string& row) -> bool {
     std::istringstream ss(row);
     std::string cell;
-    long long vals[7];
+    long long vals[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     for (int i = 0; i < 7; ++i) {
       if (!std::getline(ss, cell, ',')) return false;
       vals[i] = std::stoll(cell);
     }
+    // The sequence column was added later. Captures without it still replay,
+    // with sequence 0 -- which the feed monitor reads as "unsequenced" rather
+    // than as a gap, so an old file does not look like a broken session.
+    if (std::getline(ss, cell, ',') && !cell.empty()) vals[7] = std::stoll(cell);
+
     Tick t{};
     t.symbol = static_cast<SymbolId>(vals[0]);
     t.type = static_cast<TickType>(vals[1]);
@@ -139,6 +148,7 @@ CsvReplayFeed::CsvReplayFeed(const std::string& path) : path_(path) {
     t.quantity = static_cast<Quantity>(vals[4]);
     t.order_id = static_cast<OrderId>(vals[5]);
     t.source_ts_ns = static_cast<Nanos>(vals[6]);
+    t.sequence = static_cast<std::uint64_t>(vals[7]);
     ticks_.push_back(t);
     return true;
   };

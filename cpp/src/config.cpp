@@ -74,6 +74,8 @@ const std::vector<std::string>& config_keys() {
       "max_orders_per_second", "max_daily_orders", "max_drawdown",
       // order management
       "max_open_orders", "ack_timeout_ms", "order_history",
+      // market data session health
+      "feed_require_sequence", "feed_halt_on_gap", "feed_tolerated_gap", "feed_stale_ms",
       // durability
       "journal_path", "journal_sync", "journal_sync_interval", "allow_unclean_start",
       // output / ops
@@ -233,6 +235,22 @@ bool apply_config_setting(const std::string& key, const std::string& value, AppC
     if (!need_i64("order_history") || !need_positive("order_history", i)) return false;
     cfg.engine.oms.retired_history = static_cast<std::size_t>(i);
 
+    // --- market data session health -----------------------------------------
+  } else if (key == "feed_require_sequence") {
+    if (!need_bool("feed_require_sequence")) return false;
+    cfg.engine.feed_health.require_sequence = b;
+  } else if (key == "feed_halt_on_gap") {
+    if (!need_bool("feed_halt_on_gap")) return false;
+    cfg.engine.feed_health.halt_on_gap = b;
+  } else if (key == "feed_tolerated_gap") {
+    if (!need_u64("feed_tolerated_gap")) return false;
+    cfg.engine.feed_health.tolerated_gap = u;
+  } else if (key == "feed_stale_ms") {
+    // 0 disables the watchdog, so unlike the other durations this one is
+    // allowed to be zero -- but not negative.
+    if (!need_u64("feed_stale_ms")) return false;
+    cfg.engine.feed_health.stale_after_ns = static_cast<Nanos>(u) * 1'000'000;
+
     // --- durability ---------------------------------------------------------
   } else if (key == "journal_path") {
     cfg.journal_path = value;
@@ -380,6 +398,13 @@ std::string describe_config(const AppConfig& cfg) {
      << "  max_open_orders         = " << cfg.engine.oms.max_open_orders << "\n"
      << "  ack_timeout_ms          = " << (cfg.engine.oms.ack_timeout_ns / 1'000'000) << "\n"
      << "  order_history           = " << cfg.engine.oms.retired_history << "\n"
+     << "  feed_require_sequence   = "
+     << (cfg.engine.feed_health.require_sequence ? "true" : "false") << "\n"
+     << "  feed_halt_on_gap        = "
+     << (cfg.engine.feed_health.halt_on_gap ? "true" : "false") << "\n"
+     << "  feed_tolerated_gap      = " << cfg.engine.feed_health.tolerated_gap << "\n"
+     << "  feed_stale_ms           = " << (cfg.engine.feed_health.stale_after_ns / 1'000'000)
+     << "\n"
      << "  journal_path            = "
      << (cfg.journal_path.empty() ? "(none -- state is lost on crash)" : cfg.journal_path) << "\n"
      << "  journal_sync            = " << to_string(cfg.journal_sync) << "\n"
