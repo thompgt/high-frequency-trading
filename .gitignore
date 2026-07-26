@@ -11,3 +11,11 @@ data/*.csv
 data/*.parquet
 .env
 .ipynb_checkpoints/
+
+# C++ build artifacts
+cpp/build/
+cpp/cmake-build*/
+*.o
+*.d
+*.a
+*.obj

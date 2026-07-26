@@ -36,7 +36,18 @@ class PaperExecutionVenue(ExecutionVenue):
             direction = 1 if prev_qty > 0 else -1
             self.realized_pnl += (fill_price - avg_entry) * closing_qty * direction
             new_qty = prev_qty + signed_qty
-            self._cost_basis[order.symbol] = avg_entry * new_qty if new_qty else 0.0
+
+            if new_qty == 0:
+                self._cost_basis[order.symbol] = 0.0
+            elif (new_qty > 0) == (prev_qty > 0):
+                # partial close: the remainder keeps the original average entry
+                self._cost_basis[order.symbol] = avg_entry * new_qty
+            else:
+                # the order flipped the position; the residual is a new
+                # position opened at *this* fill price. Carrying the old
+                # average forward would double-count PnL already realized
+                # above. (This was a bug -- no test covered a flip.)
+                self._cost_basis[order.symbol] = fill_price * new_qty
 
         self.realized_pnl -= fee
         self.positions[order.symbol] = new_qty

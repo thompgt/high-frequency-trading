@@ -1,0 +1,94 @@
+// The engine: feed -> ring buffer -> order book -> strategy -> venue.
+//
+// This is the C++ equivalent of hft/core/engine.py plus hft/main.py's wiring,
+// with the order book inserted into the path (Python had no book) and with a
+// genuinely concurrent ingestion thread rather than an asyncio task.
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <string>
+
+#include "hft/execution.hpp"
+#include "hft/feed.hpp"
+#include "hft/latency.hpp"
+#include "hft/order_book.hpp"
+#include "hft/ring_buffer.hpp"
+#include "hft/strategy.hpp"
+#include "hft/types.hpp"
+
+namespace hft {
+
+struct EngineConfig {
+  std::size_t fast_window = 5;
+  std::size_t slow_window = 20;
+  Quantity order_quantity = 1;
+  double slippage_bps = 1.0;
+  double fee_bps = 0.5;
+  Price min_price = 5000;
+  Price max_price = 15000;
+  std::size_t ring_capacity = 1 << 16;
+  // When true the feed runs on its own thread and hands ticks over through the
+  // lock-free ring buffer. When false everything runs inline on one thread,
+  // which is the right mode for benchmarking the pipeline itself without
+  // cross-core hand-off noise.
+  bool threaded = true;
+  // Cross real book liquidity on execution instead of the flat-bps model.
+  bool cross_book = true;
+  bool record_curve = true;
+};
+
+struct EngineStats {
+  std::uint64_t ticks = 0;
+  std::uint64_t adds = 0;
+  std::uint64_t cancels = 0;
+  std::uint64_t cancel_rejected = 0;  // order already traded away
+  std::uint64_t aggressive_orders = 0;
+  std::uint64_t book_trades = 0;
+  std::uint64_t signals = 0;
+  std::uint64_t orders_sent = 0;
+  std::uint64_t dropped_ticks = 0;
+  Nanos wall_ns = 0;
+
+  double ticks_per_second() const {
+    return wall_ns > 0 ? static_cast<double>(ticks) * 1e9 / static_cast<double>(wall_ns) : 0.0;
+  }
+};
+
+class Engine {
+ public:
+  explicit Engine(EngineConfig config);
+
+  // Drains `feed` to exhaustion and returns run statistics.
+  EngineStats run(MarketDataSource& feed);
+
+  OrderBook& book() { return book_; }
+  const OrderBook& book() const { return book_; }
+  PaperVenue& venue() { return venue_; }
+  const PaperVenue& venue() const { return venue_; }
+  MovingAverageCrossover& strategy() { return strategy_; }
+  LatencyRecorder& latency() { return latency_; }
+  const LatencyRecorder& latency() const { return latency_; }
+  const EngineConfig& config() const { return cfg_; }
+
+  // Applies one tick through the whole pipeline. Public so tests can drive the
+  // engine deterministically without a feed or a thread.
+  void process(const Tick& tick, EngineStats& stats);
+
+  bool write_book_snapshot_csv(const std::string& path, std::size_t levels) const;
+
+ private:
+  EngineStats run_inline(MarketDataSource& feed);
+  EngineStats run_threaded(MarketDataSource& feed);
+
+  EngineConfig cfg_;
+  OrderBook book_;
+  MovingAverageCrossover strategy_;
+  PaperVenue venue_;
+  LatencyRecorder latency_;
+  SpscRingBuffer<Tick> ring_;
+  std::vector<Trade> trade_scratch_;  // reused so matching never allocates
+  OrderId next_order_id_ = 1;
+};
+
+}  // namespace hft
