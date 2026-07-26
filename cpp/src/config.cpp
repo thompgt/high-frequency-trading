@@ -72,6 +72,8 @@ const std::vector<std::string>& config_keys() {
       "risk_enabled", "max_order_quantity", "max_order_notional",
       "max_position_per_symbol", "max_gross_position", "price_collar_bps",
       "max_orders_per_second", "max_daily_orders", "max_drawdown",
+      // order management
+      "max_open_orders", "ack_timeout_ms", "order_history",
       // output / ops
       "out_dir", "depth_levels", "log_level", "flatten_on_exit",
   };
@@ -216,6 +218,19 @@ bool apply_config_setting(const std::string& key, const std::string& value, AppC
     if (!need_double("max_drawdown") || !need_non_negative_d("max_drawdown", d)) return false;
     cfg.engine.risk.max_drawdown = d;
 
+    // --- order management ---------------------------------------------------
+  } else if (key == "max_open_orders") {
+    if (!need_i64("max_open_orders") || !need_positive("max_open_orders", i)) return false;
+    cfg.engine.oms.max_open_orders = static_cast<std::size_t>(i);
+  } else if (key == "ack_timeout_ms") {
+    // Milliseconds in the config, nanoseconds internally: nobody wants to write
+    // an ack timeout with nine zeroes in it.
+    if (!need_i64("ack_timeout_ms") || !need_positive("ack_timeout_ms", i)) return false;
+    cfg.engine.oms.ack_timeout_ns = static_cast<Nanos>(i) * 1'000'000;
+  } else if (key == "order_history") {
+    if (!need_i64("order_history") || !need_positive("order_history", i)) return false;
+    cfg.engine.oms.retired_history = static_cast<std::size_t>(i);
+
     // --- output / ops -------------------------------------------------------
   } else if (key == "out_dir") {
     cfg.out_dir = value;
@@ -341,6 +356,9 @@ std::string describe_config(const AppConfig& cfg) {
      << "  max_orders_per_second   = " << cfg.engine.risk.max_orders_per_second << "\n"
      << "  max_daily_orders        = " << cfg.engine.risk.max_daily_orders << "\n"
      << "  max_drawdown            = " << cfg.engine.risk.max_drawdown << "\n"
+     << "  max_open_orders         = " << cfg.engine.oms.max_open_orders << "\n"
+     << "  ack_timeout_ms          = " << (cfg.engine.oms.ack_timeout_ns / 1'000'000) << "\n"
+     << "  order_history           = " << cfg.engine.oms.retired_history << "\n"
      << "  out_dir                 = " << (cfg.out_dir.empty() ? "(none)" : cfg.out_dir) << "\n"
      << "  depth_levels            = " << cfg.depth_levels << "\n"
      << "  log_level               = " << to_string(cfg.log_level) << "\n"

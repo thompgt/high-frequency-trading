@@ -13,9 +13,55 @@ Engine::Engine(EngineConfig config)
       venue_(PaperVenue::Config{config.slippage_bps, config.fee_bps,
                                 config.cross_book ? &book_ : nullptr}),
       risk_(config.risk),
+      oms_(config.oms),
       ring_(config.ring_capacity) {
   trade_scratch_.reserve(256);
   venue_.set_record_curve(config.record_curve);
+  // The pre-trade gate must see sent-but-unfilled quantity, not just filled
+  // position -- otherwise a burst of in-flight orders walks past the limit.
+  risk_.set_exposure_source(&oms_);
+}
+
+Fill Engine::dispatch(const Order& order, Price reference_price, ClOrdId cl_ord_id,
+                      EngineStats& stats) {
+  const Fill fill = venue_.submit(order, reference_price);
+
+  // Translate the venue's synchronous answer into the report sequence a real
+  // venue would send. Doing it here rather than special-casing the OMS means
+  // the state machine sees exactly the same event stream it would see from a
+  // live session, and swapping PaperVenue for a real one changes nothing
+  // downstream.
+  ExecutionReport rep{};
+  rep.cl_ord_id = cl_ord_id;
+  rep.venue_order_id = fill.order_id;
+  rep.symbol = order.symbol;
+  rep.side = order.side;
+  rep.ts_ns = fill.filled_ts_ns;
+
+  rep.type = ExecType::Acked;
+  oms_.apply(rep);
+
+  if (fill.quantity > 0) {
+    rep.type = ExecType::Fill;
+    rep.price = fill.price;
+    rep.quantity = fill.quantity;
+    rep.fee = fill.fee;
+    oms_.apply(rep);
+  }
+
+  // A marketable order does not rest, so any remainder is dead as soon as the
+  // venue answers. Reporting it as cancelled is what the venue would do for an
+  // IOC, and it is what stops the unfilled part sitting in the OMS as
+  // permanent phantom exposure.
+  const OrderRecord* rec = oms_.find(cl_ord_id);
+  if (rec != nullptr && is_working(rec->state)) {
+    if (fill.quantity > 0) ++stats.partial_fills;
+    rep.type = ExecType::Cancelled;
+    rep.quantity = 0;
+    rep.fee = 0.0;
+    oms_.apply(rep);
+  }
+  return fill;
 }
 
 void Engine::process(const Tick& tick, EngineStats& stats) {
@@ -101,7 +147,15 @@ void Engine::process(const Tick& tick, EngineStats& stats) {
 
   // --- stage 5: execution --------------------------------------------------
   const Nanos ord_start = now_ns();
-  const Fill fill = venue_.submit(order, signal.price);
+  const ClOrdId cl_ord_id = oms_.create(order, ord_start);
+  if (cl_ord_id == 0) {
+    // No room to track it. An order we cannot track is one we cannot cancel or
+    // reconcile, so it does not go out -- refusing to trade is always
+    // recoverable, losing track of a live order is not.
+    ++stats.untracked_rejects;
+    return;
+  }
+  const Fill fill = dispatch(order, signal.price, cl_ord_id, stats);
   const Nanos ord_end = now_ns();
 
   latency_.order_round_trip.record(ord_end - ord_start);
@@ -138,7 +192,16 @@ std::uint64_t Engine::flatten(EngineStats& stats) {
     // against a price of zero would silently book a fictional loss.
     const Price reference = have_mid ? price_from_double(mid) : last_reference_;
     if (reference <= 0) continue;  // never seen a usable price: nothing sane to do
-    const Fill fill = venue_.submit(order, reference);
+
+    // Flattening bypasses the pre-trade gate (see the header) but not the OMS:
+    // an exit order is still an order, and losing track of it would leave us
+    // unsure whether the position is actually closed.
+    const ClOrdId cl_ord_id = oms_.create(order, order.created_ts_ns);
+    if (cl_ord_id == 0) {
+      ++stats.untracked_rejects;
+      continue;
+    }
+    const Fill fill = dispatch(order, reference, cl_ord_id, stats);
     risk_.on_fill(fill);
     ++sent;
     ++stats.flatten_orders;

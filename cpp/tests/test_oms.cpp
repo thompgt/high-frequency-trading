@@ -6,7 +6,10 @@
 
 #include <vector>
 
+#include "hft/engine.hpp"
+#include "hft/feed.hpp"
 #include "hft/oms.hpp"
+#include "hft/risk.hpp"
 #include "test_harness.hpp"
 
 using namespace hft;
@@ -529,4 +532,168 @@ TEST(oms_exposure_stays_consistent_through_a_randomised_lifecycle) {
   CHECK_EQ(oms.stats().overfills, std::uint64_t(0));
   CHECK_EQ(oms.stats().unknown_reports, std::uint64_t(0));
   CHECK_EQ(oms.stats().invalid_transitions, std::uint64_t(0));
+}
+
+// ================================================ in-flight risk integration
+
+namespace {
+
+// Stands in for the OMS so the risk checks can be driven to exact values.
+class FakeExposure : public ExposureSource {
+ public:
+  std::int64_t net = 0;
+  std::int64_t gross = 0;
+  std::int64_t working_exposure(SymbolId) const override { return net; }
+  std::int64_t gross_working_exposure() const override { return gross; }
+};
+
+Order risk_order(Side side, Quantity qty) {
+  Order o{};
+  o.symbol = 0;
+  o.side = side;
+  o.type = OrderType::Market;
+  o.price = 10000;
+  o.quantity = qty;
+  return o;
+}
+
+}  // namespace
+
+TEST(risk_position_limit_counts_orders_that_are_still_in_flight) {
+  RiskLimits limits;
+  limits.max_position_per_symbol = 100;
+  limits.max_gross_position = 1'000'000;
+  RiskManager risk(limits);
+
+  // With no in-flight view, a 100-lot order is fine from a flat position...
+  CHECK(risk.check(risk_order(Side::Buy, 100), 10000, 0).accepted);
+
+  // ...but once 100 lots are already sent and unanswered, the same order would
+  // put us at 200. This is the hole the exposure source closes: without it,
+  // filled position is still zero and the check would pass.
+  FakeExposure pending;
+  pending.net = 100;
+  pending.gross = 100;
+  risk.set_exposure_source(&pending);
+
+  const RiskDecision d = risk.check(risk_order(Side::Buy, 100), 10000, 0);
+  CHECK_FALSE(d.accepted);
+  CHECK_EQ(int(d.reason), int(RejectReason::PositionLimitExceeded));
+
+  // An order that reduces the in-flight exposure is still allowed.
+  CHECK(risk.check(risk_order(Side::Sell, 100), 10000, 0).accepted);
+}
+
+TEST(risk_gross_limit_counts_in_flight_exposure) {
+  RiskLimits limits;
+  limits.max_position_per_symbol = 1'000'000;
+  limits.max_gross_position = 150;
+  RiskManager risk(limits);
+
+  FakeExposure pending;
+  pending.net = 0;      // this symbol is flat in flight...
+  pending.gross = 140;  // ...but other symbols carry 140 lots
+  risk.set_exposure_source(&pending);
+
+  CHECK(risk.check(risk_order(Side::Buy, 10), 10000, 0).accepted);
+  const RiskDecision d = risk.check(risk_order(Side::Buy, 20), 10000, 0);
+  CHECK_FALSE(d.accepted);
+  CHECK_EQ(int(d.reason), int(RejectReason::GrossPositionLimitExceeded));
+}
+
+TEST(risk_without_an_exposure_source_behaves_as_before) {
+  // Position-only checking must stay the default, so nothing that constructs a
+  // bare RiskManager changes behaviour.
+  RiskLimits limits;
+  limits.max_position_per_symbol = 100;
+  RiskManager risk(limits);
+  CHECK(risk.exposure_source() == nullptr);
+  CHECK(risk.check(risk_order(Side::Buy, 100), 10000, 0).accepted);
+}
+
+// ====================================================== engine integration
+
+namespace {
+
+EngineConfig oms_engine_config() {
+  EngineConfig cfg;
+  cfg.threaded = false;
+  cfg.fast_window = 3;
+  cfg.slow_window = 8;
+  cfg.order_quantity = 5;
+  cfg.record_curve = false;
+  cfg.risk.max_orders_per_second = 1'000'000'000u;
+  return cfg;
+}
+
+SyntheticFeed::Params oms_feed_params(std::size_t events) {
+  SyntheticFeed::Params p;
+  p.total_events = events;
+  p.seed = 0xABCDEF01ULL;
+  return p;
+}
+
+}  // namespace
+
+TEST(engine_tracks_every_order_it_sends_and_leaves_none_working) {
+  Engine engine(oms_engine_config());
+  SyntheticFeed feed(oms_feed_params(120'000));
+  EngineStats stats = engine.run(feed);
+  engine.flatten(stats);
+
+  const OmsStats& oms = engine.oms().stats();
+  CHECK(stats.orders_sent > 0);
+  // Every order the engine sent got an id and a lifecycle.
+  CHECK_EQ(oms.created, stats.orders_sent + stats.flatten_orders);
+  CHECK_EQ(oms.acked, oms.created);
+
+  // Nothing is left in an unresolved state, and no exposure is stranded.
+  CHECK_EQ(engine.oms().open_count(), std::size_t(0));
+  CHECK_EQ(engine.oms().gross_working_exposure(), std::int64_t(0));
+
+  // A synchronous venue should produce no reconciliation breaks at all. Any
+  // count here means the engine and the OMS disagree about what happened.
+  CHECK_EQ(oms.breaks(), std::uint64_t(0));
+  CHECK_EQ(oms.unknown_reports, std::uint64_t(0));
+  CHECK_EQ(oms.overfills, std::uint64_t(0));
+}
+
+TEST(engine_closes_out_the_remainder_of_a_partially_filled_order) {
+  // Crossing a thin book fills part of a market order; the rest never rests.
+  // If the engine left those remainders working, exposure would ratchet up
+  // forever and the position limit would eventually reject everything.
+  EngineConfig cfg = oms_engine_config();
+  cfg.cross_book = true;
+  cfg.order_quantity = 400;  // large enough to outrun the depth available
+  Engine engine(cfg);
+
+  SyntheticFeed feed(oms_feed_params(120'000));
+  EngineStats stats = engine.run(feed);
+
+  CHECK(stats.orders_sent > 0);
+  CHECK_EQ(engine.oms().open_count(), std::size_t(0));
+  CHECK_EQ(engine.oms().gross_working_exposure(), std::int64_t(0));
+  CHECK_EQ(engine.oms().stats().breaks(), std::uint64_t(0));
+}
+
+TEST(engine_order_ids_line_up_with_the_venue_position) {
+  // The OMS's own view of what filled must agree with the venue's position.
+  // These are computed by completely separate code paths, so agreement is a
+  // real check rather than a tautology.
+  Engine engine(oms_engine_config());
+  SyntheticFeed feed(oms_feed_params(80'000));
+  EngineStats stats = engine.run(feed);
+
+  std::int64_t oms_position = 0;
+  for (ClOrdId id = 1; id <= engine.oms().stats().created; ++id) {
+    const OrderRecord* rec = engine.oms().find(id);
+    if (rec == nullptr) continue;  // aged out of the history window
+    oms_position += (rec->side == Side::Buy ? rec->filled : -rec->filled);
+  }
+
+  // Only meaningful if the whole run still fits in the history window.
+  if (engine.oms().stats().created <= engine.oms().config().retired_history) {
+    CHECK_EQ(oms_position, engine.venue().position(0));
+  }
+  CHECK_EQ(stats.untracked_rejects, std::uint64_t(0));
 }

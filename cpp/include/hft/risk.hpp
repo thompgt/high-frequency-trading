@@ -84,6 +84,25 @@ struct RiskDecision {
   explicit operator bool() const { return accepted; }
 };
 
+// Sent-but-unfilled quantity, supplied by whatever tracks live orders (in this
+// engine, the OrderManager).
+//
+// Filled position is only half of the inventory a limit needs to bound. An
+// engine that has fired 500 lots and had none of them come back yet is carrying
+// 500 lots of risk, and a limit that looks only at filled position will happily
+// let it fire 500 more. Checking against position + working closes that hole.
+//
+// Kept as an interface so risk.hpp does not depend on the OMS -- the risk layer
+// should stay the most boring, least entangled code here.
+class ExposureSource {
+ public:
+  virtual ~ExposureSource() = default;
+  // Signed: buy leaves minus sell leaves, for one symbol.
+  virtual std::int64_t working_exposure(SymbolId symbol) const = 0;
+  // Sum of |working_exposure| across symbols.
+  virtual std::int64_t gross_working_exposure() const = 0;
+};
+
 class RiskManager {
  public:
   explicit RiskManager(RiskLimits limits);
@@ -93,6 +112,12 @@ class RiskManager {
   // against. `now_ns` is injected so tests can drive the throttle
   // deterministically instead of sleeping.
   RiskDecision check(const Order& order, Price reference_price, Nanos now_ns);
+
+  // Attaches a source of in-flight exposure. Not owned, and must outlive the
+  // manager. Null (the default) means position-only checking, which is only
+  // safe for a venue that fills synchronously.
+  void set_exposure_source(const ExposureSource* source) { exposure_ = source; }
+  const ExposureSource* exposure_source() const { return exposure_; }
 
   // Call after every fill so inventory and drawdown stay current. Breaching
   // the drawdown limit engages the kill switch from here.
@@ -135,6 +160,7 @@ class RiskManager {
   RiskDecision reject(RejectReason reason);
 
   RiskLimits limits_;
+  const ExposureSource* exposure_ = nullptr;
   std::vector<std::int64_t> positions_;  // indexed by SymbolId, grown on demand
   std::int64_t gross_position_ = 0;
 

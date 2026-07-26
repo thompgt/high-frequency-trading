@@ -86,19 +86,34 @@ RiskDecision RiskManager::check(const Order& order, Price reference_price, Nanos
     }
   }
 
-  // 4. Inventory limits, evaluated on the position this order *would* create.
+  // 4. Inventory limits, evaluated on the position this order *would* create
+  //    if it filled -- including everything already sent and not yet answered.
+  //    Without the in-flight term a burst of orders can march straight past the
+  //    position limit while every one of them is still in the air.
   const std::int64_t signed_qty =
       (order.side == Side::Buy) ? order.quantity : -order.quantity;
-  const std::int64_t current = position(order.symbol);
+  const std::int64_t filled = position(order.symbol);
+  const std::int64_t working = exposure_ != nullptr ? exposure_->working_exposure(order.symbol) : 0;
+  const std::int64_t current = filled + working;
   const std::int64_t projected = current + signed_qty;
 
   if (std::llabs(projected) > limits_.max_position_per_symbol) {
     return reject(RejectReason::PositionLimitExceeded);
   }
 
-  // Gross exposure across all symbols, adjusted for this symbol's change.
-  const std::int64_t projected_gross =
-      gross_position_ - std::llabs(current) + std::llabs(projected);
+  // Gross exposure across all symbols, with this symbol's contribution replaced
+  // by its projected one.
+  //
+  // The other symbols' term is |filled| + |working| summed separately, which
+  // over-states any symbol whose filled position and working orders point in
+  // opposite directions. That is deliberate: the error is always toward
+  // rejecting, and computing it exactly would mean walking every symbol on
+  // every order -- work the pre-trade path must not do.
+  const std::int64_t gross_working =
+      exposure_ != nullptr ? exposure_->gross_working_exposure() : 0;
+  const std::int64_t others =
+      (gross_position_ - std::llabs(filled)) + (gross_working - std::llabs(working));
+  const std::int64_t projected_gross = others + std::llabs(projected);
   if (projected_gross > limits_.max_gross_position) {
     return reject(RejectReason::GrossPositionLimitExceeded);
   }

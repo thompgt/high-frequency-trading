@@ -45,6 +45,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "hft/risk.hpp"
 #include "hft/types.hpp"
 
 namespace hft {
@@ -138,7 +139,7 @@ struct OmsStats {
   }
 };
 
-class OrderManager {
+class OrderManager : public ExposureSource {
  public:
   struct Config {
     // How long an order may sit unacknowledged before we declare its state
@@ -194,10 +195,10 @@ class OrderManager {
   // Signed working exposure: buy leaves minus sell leaves. Adding this to the
   // current position gives the position we would hold if everything in flight
   // filled -- the quantity a position limit actually needs to bound.
-  std::int64_t working_exposure(SymbolId symbol) const;
+  std::int64_t working_exposure(SymbolId symbol) const override;
 
   // Sum of |working_exposure| across symbols.
-  std::int64_t gross_working_exposure() const;
+  std::int64_t gross_working_exposure() const override;
 
   const OmsStats& stats() const { return stats_; }
   const Config& config() const { return cfg_; }

@@ -101,6 +101,8 @@ std::string metrics_json(const Engine& engine, const EngineStats& stats,
      << "    \"signals\": " << stats.signals << ",\n"
      << "    \"orders_sent\": " << stats.orders_sent << ",\n"
      << "    \"risk_rejects\": " << stats.risk_rejects << ",\n"
+     << "    \"untracked_rejects\": " << stats.untracked_rejects << ",\n"
+     << "    \"partial_fills\": " << stats.partial_fills << ",\n"
      << "    \"flatten_orders\": " << stats.flatten_orders << ",\n"
      << "    \"fills\": " << venue.fill_count() << ",\n"
      << "    \"realized_pnl\": " << venue.realized_pnl() << ",\n"
@@ -113,6 +115,32 @@ std::string metrics_json(const Engine& engine, const EngineStats& stats,
     first = false;
   }
   os << "}\n  },\n";
+
+  // --- order lifecycle ------------------------------------------------------
+  // `breaks` is the number to alert on: it is non-zero only when our view of
+  // an order and the venue's have diverged.
+  const OmsStats& oms = engine.oms().stats();
+  os << "  \"orders\": {\n"
+     << "    \"created\": " << oms.created << ",\n"
+     << "    \"acked\": " << oms.acked << ",\n"
+     << "    \"fills\": " << oms.fills << ",\n"
+     << "    \"filled_orders\": " << oms.filled_orders << ",\n"
+     << "    \"cancels_requested\": " << oms.cancels_requested << ",\n"
+     << "    \"cancelled\": " << oms.cancelled << ",\n"
+     << "    \"cancel_rejected\": " << oms.cancel_rejected << ",\n"
+     << "    \"venue_rejected\": " << oms.venue_rejected << ",\n"
+     << "    \"expired\": " << oms.expired << ",\n"
+     << "    \"working\": " << engine.oms().open_count() << ",\n"
+     << "    \"gross_working_quantity\": " << engine.oms().gross_working_exposure() << ",\n"
+     << "    \"breaks\": " << oms.breaks() << ",\n"
+     << "    \"breaks_by_kind\": {\n"
+     << "      \"unknown_reports\": " << oms.unknown_reports << ",\n"
+     << "      \"invalid_transitions\": " << oms.invalid_transitions << ",\n"
+     << "      \"overfills\": " << oms.overfills << ",\n"
+     << "      \"capacity_rejects\": " << oms.capacity_rejects << ",\n"
+     << "      \"late_reports\": " << oms.late_reports << "\n"
+     << "    }\n"
+     << "  },\n";
 
   // --- risk -----------------------------------------------------------------
   os << "  \"risk\": {\n"

@@ -335,9 +335,23 @@ int run(int argc, char** argv) {
   std::printf("strategy signals    : %llu\n", (unsigned long long)stats.signals);
   std::printf("orders sent         : %llu\n", (unsigned long long)stats.orders_sent);
   std::printf("risk rejects        : %llu\n", (unsigned long long)stats.risk_rejects);
+  std::printf("untracked rejects   : %llu  (no OMS slot; never sent)\n",
+              (unsigned long long)stats.untracked_rejects);
   std::printf("ring buffer drops   : %llu\n", (unsigned long long)stats.dropped_ticks);
   std::printf("wall time           : %.3f s\n", (double)stats.wall_ns / 1e9);
   std::printf("throughput          : %.0f ticks/sec\n", stats.ticks_per_second());
+
+  std::printf("\n--- orders ---\n%s", engine->oms().summary().c_str());
+  if (engine->oms().stats().breaks() > 0) {
+    // A break means our record of an order and the venue's have diverged.
+    // Never let that scroll past as just another counter.
+    std::fprintf(stderr,
+                 "warning: %llu order reconciliation break(s) -- our view and the venue's "
+                 "do not agree; investigate before trading again\n",
+                 (unsigned long long)engine->oms().stats().breaks());
+    HFT_ERROR("order reconciliation breaks",
+              "count", static_cast<double>(engine->oms().stats().breaks()));
+  }
 
   std::printf("\n--- risk ---\n%s", engine->risk().summary().c_str());
 

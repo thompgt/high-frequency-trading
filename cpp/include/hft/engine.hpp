@@ -13,6 +13,7 @@
 #include "hft/execution.hpp"
 #include "hft/feed.hpp"
 #include "hft/latency.hpp"
+#include "hft/oms.hpp"
 #include "hft/order_book.hpp"
 #include "hft/ring_buffer.hpp"
 #include "hft/risk.hpp"
@@ -40,6 +41,9 @@ struct EngineConfig {
   bool record_curve = true;
   // Pre-trade risk limits. Every order goes through these before the venue.
   RiskLimits risk;
+  // Order lifecycle tracking. Its exposure feeds the risk gate, so an order
+  // that cannot be tracked is an order that does not get sent.
+  OrderManager::Config oms;
 };
 
 struct EngineStats {
@@ -54,6 +58,12 @@ struct EngineStats {
   std::uint64_t dropped_ticks = 0;
   std::uint64_t risk_rejects = 0;
   std::uint64_t flatten_orders = 0;
+  // Orders the OMS had no room to track, and which were therefore never sent.
+  std::uint64_t untracked_rejects = 0;
+  // Partially-filled marketable orders whose remainder was closed out. A
+  // market order does not rest, so its unfilled remainder is dead the moment
+  // the venue answers -- leaving it "working" would leak exposure forever.
+  std::uint64_t partial_fills = 0;
   bool halted = false;
   Nanos wall_ns = 0;
 
@@ -76,6 +86,8 @@ class Engine {
   MovingAverageCrossover& strategy() { return strategy_; }
   RiskManager& risk() { return risk_; }
   const RiskManager& risk() const { return risk_; }
+  OrderManager& oms() { return oms_; }
+  const OrderManager& oms() const { return oms_; }
   LatencyRecorder& latency() { return latency_; }
   const LatencyRecorder& latency() const { return latency_; }
   const EngineConfig& config() const { return cfg_; }
@@ -100,11 +112,17 @@ class Engine {
   EngineStats run_inline(MarketDataSource& feed);
   EngineStats run_threaded(MarketDataSource& feed);
 
+  // Sends an accepted order to the venue and drives the resulting execution
+  // reports through the OMS. Returns the fill.
+  Fill dispatch(const Order& order, Price reference_price, ClOrdId cl_ord_id,
+                EngineStats& stats);
+
   EngineConfig cfg_;
   OrderBook book_;
   MovingAverageCrossover strategy_;
   PaperVenue venue_;
   RiskManager risk_;
+  OrderManager oms_;
   LatencyRecorder latency_;
   SpscRingBuffer<Tick> ring_;
   std::vector<Trade> trade_scratch_;  // reused so matching never allocates
