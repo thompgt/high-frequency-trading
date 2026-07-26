@@ -717,7 +717,8 @@ TEST(venue_crossing_the_book_pays_the_volume_weighted_price) {
   OrderBook b = make_book();
   b.add_limit(1, Side::Sell, 10000, 5);
   b.add_limit(2, Side::Sell, 10100, 5);
-  PaperVenue v(PaperVenue::Config{0.0, 0.0, &b});
+  SingleBookProvider books(&b);
+  PaperVenue v(PaperVenue::Config{0.0, 0.0, &books});
   const Fill f = v.submit(mk_order(9, Side::Buy, 10), 10000);
   CHECK_EQ(f.quantity, Quantity(10));
   CHECK_EQ(f.price, Price(10050));  // (5*10000 + 5*10100) / 10

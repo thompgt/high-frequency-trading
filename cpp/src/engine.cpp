@@ -8,19 +8,62 @@ namespace hft {
 
 Engine::Engine(EngineConfig config)
     : cfg_(config),
-      book_(config.min_price, config.max_price),
+      instruments_(config.instruments),
       strategy_(config.fast_window, config.slow_window),
-      venue_(PaperVenue::Config{config.slippage_bps, config.fee_bps,
-                                config.cross_book ? &book_ : nullptr}),
+      venue_(PaperVenue::Config{config.slippage_bps, config.fee_bps, nullptr}),
       risk_(config.risk),
       oms_(config.oms),
       feed_(config.feed_health),
       ring_(config.ring_capacity) {
+  // No instruments configured means the single-symbol case: synthesise one
+  // from the price band so every existing configuration keeps working and the
+  // common setup stays a one-liner.
+  if (instruments_.empty()) {
+    Instrument only;
+    only.symbol = "DEFAULT";
+    only.min_price = config.min_price;
+    only.max_price = config.max_price;
+    std::string error;
+    if (!instruments_.add(only, error)) {
+      throw std::invalid_argument("invalid default instrument: " + error);
+    }
+  }
+
+  books_.reserve(instruments_.size());
+  for (const auto& instrument : instruments_.all()) {
+    books_.push_back(std::make_unique<OrderBook>(instrument.min_price, instrument.max_price));
+    // A per-instrument ceiling may only tighten the global one. Enforced here
+    // rather than trusted from config, so a mistake cannot widen a limit.
+    if (instrument.max_position > 0) {
+      risk_.set_symbol_limit(instrument.id, instrument.max_position);
+    }
+  }
+
+  if (config.cross_book) venue_.set_books(&book_provider_);
+
   trade_scratch_.reserve(256);
   venue_.set_record_curve(config.record_curve);
   // The pre-trade gate must see sent-but-unfilled quantity, not just filled
   // position -- otherwise a burst of in-flight orders walks past the limit.
   risk_.set_exposure_source(&oms_);
+}
+
+OrderBook* Engine::Books::book_for(SymbolId symbol) {
+  return symbol < engine_->books_.size() ? engine_->books_[symbol].get() : nullptr;
+}
+
+OrderBook& Engine::book(SymbolId symbol) {
+  if (symbol >= books_.size()) {
+    throw std::out_of_range("no book for symbol " + std::to_string(symbol));
+  }
+  return *books_[symbol];
+}
+
+const OrderBook& Engine::book(SymbolId symbol) const {
+  if (symbol >= books_.size()) {
+    throw std::out_of_range("no book for symbol " + std::to_string(symbol));
+  }
+  return *books_[symbol];
 }
 
 void Engine::emit(const ExecutionReport& report, EngineStats& stats) {
@@ -113,6 +156,27 @@ void Engine::process(const Tick& tick, EngineStats& stats) {
     ++stats.ticks_while_faulted;
   }
 
+  // --- stage 0b: is this message for something we trade? -------------------
+  const Instrument* instrument = instruments_.find(tick.symbol);
+  if (instrument == nullptr) {
+    // A feed sending a symbol we never subscribed to is a configuration or
+    // entitlement problem. Guessing a price band for it would be worse than
+    // dropping it.
+    ++stats.unknown_symbol_ticks;
+    return;
+  }
+  OrderBook& book_ = *books_[tick.symbol];
+
+  // Contract validation. A price off the tick grid or a size off the lot size
+  // means either the feed is wrong or our instrument definition is; either way
+  // applying it would build a book the exchange does not have.
+  const bool needs_price = tick.type == TickType::AddOrder;
+  if (needs_price && (!instrument->price_is_valid(tick.price) ||
+                      !instrument->quantity_is_valid(tick.quantity))) {
+    ++stats.contract_violations;
+    return;
+  }
+
   // --- stage 1: apply the message to the book ------------------------------
   const Nanos book_start = now_ns();
   trade_scratch_.clear();
@@ -147,18 +211,23 @@ void Engine::process(const Tick& tick, EngineStats& stats) {
   // The mid of the live book is a far better fair-value estimate than the last
   // trade print, which is why having a real book matters even for a strategy
   // this simple.
+  // Fair value is per instrument -- carrying one across symbols would price
+  // one product off another's book.
+  if (tick.symbol >= last_reference_.size()) {
+    last_reference_.resize(static_cast<std::size_t>(tick.symbol) + 1, 0);
+  }
   Price reference;
   double mid = 0.0;
   if (book_.mid_price(mid)) {
     reference = price_from_double(mid);
   } else if (tick.price > 0) {
     reference = tick.price;
-  } else if (last_reference_ > 0) {
-    reference = last_reference_;
+  } else if (last_reference_[tick.symbol] > 0) {
+    reference = last_reference_[tick.symbol];
   } else {
     return;  // one-sided empty book and no usable price on this message
   }
-  last_reference_ = reference;
+  last_reference_[tick.symbol] = reference;
 
   // --- stage 3: strategy ---------------------------------------------------
   Signal signal{};
@@ -175,8 +244,20 @@ void Engine::process(const Tick& tick, EngineStats& stats) {
   order.symbol = signal.symbol;
   order.side = signal.side;
   order.type = OrderType::Market;
-  order.price = signal.price;
+  // Snap to the instrument's contract before the order can reach a venue that
+  // would reject it. Rounding is toward the passive side, so it never pushes
+  // the order further into the market than the strategy asked for.
+  order.price = instrument->round_price(signal.price, signal.side);
   order.quantity = cfg_.order_quantity;
+  if (instrument->lot_size > 1) {
+    order.quantity -= order.quantity % instrument->lot_size;
+    if (order.quantity <= 0) {
+      // The configured order size is smaller than one lot, so there is no
+      // valid order to send. Counted, not silently rounded up to a lot.
+      ++stats.contract_violations;
+      return;
+    }
+  }
   order.created_ts_ns = sig_end;
 
   const Nanos risk_start = now_ns();
@@ -226,8 +307,6 @@ void Engine::process(const Tick& tick, EngineStats& stats) {
 
 std::uint64_t Engine::flatten(EngineStats& stats) {
   std::uint64_t sent = 0;
-  double mid = 0.0;
-  const bool have_mid = book_.mid_price(mid);
 
   // Snapshot first: submitting mutates the venue's position map.
   std::vector<std::pair<SymbolId, std::int64_t>> open;
@@ -244,9 +323,14 @@ std::uint64_t Engine::flatten(EngineStats& stats) {
     order.quantity = kv.second > 0 ? kv.second : -kv.second;
     order.created_ts_ns = now_ns();
 
-    // Mark the exit at the book mid, or the last fair value we saw. Flattening
-    // against a price of zero would silently book a fictional loss.
-    const Price reference = have_mid ? price_from_double(mid) : last_reference_;
+    // Mark the exit at *this instrument's* book mid, or the last fair value we
+    // saw for it. Flattening against a price of zero, or against another
+    // product's price, would silently book a fictional PnL.
+    double mid = 0.0;
+    const bool have_mid = kv.first < books_.size() && books_[kv.first]->mid_price(mid);
+    const Price fallback =
+        kv.first < last_reference_.size() ? last_reference_[kv.first] : 0;
+    const Price reference = have_mid ? price_from_double(mid) : fallback;
     if (reference <= 0) continue;  // never seen a usable price: nothing sane to do
 
     // Flattening bypasses the pre-trade gate (see the header) but not the OMS:
@@ -328,12 +412,17 @@ EngineStats Engine::run_threaded(MarketDataSource& feed) {
 bool Engine::write_book_snapshot_csv(const std::string& path, std::size_t levels) const {
   std::ofstream f(path);
   if (!f) return false;
-  f << "side,price,quantity,order_count\n";
-  for (const auto& lv : book_.depth(Side::Buy, levels)) {
-    f << "BID," << price_to_double(lv.price) << ',' << lv.quantity << ',' << lv.order_count << '\n';
-  }
-  for (const auto& lv : book_.depth(Side::Sell, levels)) {
-    f << "ASK," << price_to_double(lv.price) << ',' << lv.quantity << ',' << lv.order_count << '\n';
+  f << "symbol,side,price,quantity,order_count\n";
+  for (const auto& instrument : instruments_.all()) {
+    const OrderBook& book = *books_[instrument.id];
+    for (const auto& lv : book.depth(Side::Buy, levels)) {
+      f << instrument.symbol << ",BID," << price_to_double(lv.price) << ',' << lv.quantity << ','
+        << lv.order_count << '\n';
+    }
+    for (const auto& lv : book.depth(Side::Sell, levels)) {
+      f << instrument.symbol << ",ASK," << price_to_double(lv.price) << ',' << lv.quantity << ','
+        << lv.order_count << '\n';
+    }
   }
   return static_cast<bool>(f);
 }

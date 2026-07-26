@@ -1,5 +1,6 @@
 #include "hft/risk.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <sstream>
@@ -39,6 +40,19 @@ RiskManager::RiskManager(RiskLimits limits) : limits_(limits) { positions_.reser
 
 std::int64_t RiskManager::position(SymbolId symbol) const {
   return symbol < positions_.size() ? positions_[symbol] : 0;
+}
+
+void RiskManager::set_symbol_limit(SymbolId symbol, std::int64_t max_position) {
+  if (symbol >= symbol_limits_.size()) symbol_limits_.resize(symbol + 1, 0);
+  // Clamped, never trusted: an instrument may tighten the global limit but
+  // must not be able to widen it.
+  symbol_limits_[symbol] =
+      max_position <= 0 ? 0 : std::min(max_position, limits_.max_position_per_symbol);
+}
+
+std::int64_t RiskManager::symbol_limit(SymbolId symbol) const {
+  const std::int64_t specific = symbol < symbol_limits_.size() ? symbol_limits_[symbol] : 0;
+  return specific > 0 ? specific : limits_.max_position_per_symbol;
 }
 
 RiskDecision RiskManager::reject(RejectReason reason) {
@@ -97,7 +111,7 @@ RiskDecision RiskManager::check(const Order& order, Price reference_price, Nanos
   const std::int64_t current = filled + working;
   const std::int64_t projected = current + signed_qty;
 
-  if (std::llabs(projected) > limits_.max_position_per_symbol) {
+  if (std::llabs(projected) > symbol_limit(order.symbol)) {
     return reject(RejectReason::PositionLimitExceeded);
   }
 

@@ -60,8 +60,8 @@ bool parse_double(const std::string& v, double& out) {
 
 const std::vector<std::string>& config_keys() {
   static const std::vector<std::string> keys = {
-      // feed
-      "symbol", "events", "seed", "replay_path",
+      // feed / instruments
+      "symbol", "instrument", "events", "seed", "replay_path",
       // strategy
       "fast_window", "slow_window", "order_quantity",
       // venue
@@ -144,6 +144,13 @@ bool apply_config_setting(const std::string& key, const std::string& value, AppC
   } else if (key == "seed") {
     if (!need_u64("seed")) return false;
     cfg.seed = u;
+  } else if (key == "instrument") {
+    // Repeatable: each occurrence adds one instrument, rather than the usual
+    // last-one-wins. Listing three instruments and silently trading only the
+    // third would be a memorable way to lose money.
+    Instrument instrument;
+    if (!parse_instrument(value, instrument, error)) return false;
+    if (!cfg.engine.instruments.add(instrument, error)) return false;
   } else if (key == "replay_path") {
     cfg.replay_path = value;
 
@@ -370,8 +377,17 @@ bool validate_config(const AppConfig& cfg, std::vector<ConfigError>& errors) {
 
 std::string describe_config(const AppConfig& cfg) {
   std::ostringstream os;
-  os << "  symbol                  = " << cfg.symbol << "\n"
-     << "  events                  = " << cfg.events << "\n"
+  os << "  symbol                  = " << cfg.symbol << "\n";
+  if (cfg.engine.instruments.empty()) {
+    os << "  instrument              = (none configured -- one is synthesised from "
+          "min_price/max_price)\n";
+  } else {
+    for (const auto& i : cfg.engine.instruments.all()) {
+      os << "  instrument              = " << i.symbol << ":" << i.min_price << ":" << i.max_price
+         << ":" << i.tick_size << ":" << i.lot_size << ":" << i.max_position << "\n";
+    }
+  }
+  os << "  events                  = " << cfg.events << "\n"
      << "  seed                    = " << cfg.seed << "\n"
      << "  replay_path             = " << (cfg.replay_path.empty() ? "(none)" : cfg.replay_path)
      << "\n"

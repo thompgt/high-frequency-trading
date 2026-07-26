@@ -67,6 +67,18 @@ bool SyntheticFeed::next(Tick& out) {
                                  static_cast<std::uint64_t>(params_.tick_range)));
     out.type = TickType::AddOrder;
     out.price = (side == Side::Buy) ? fair_ - offset : fair_ + offset;
+    if (params_.tick_size > 1) {
+      // Snap onto the instrument's grid, away from the mid so a buy stays
+      // below fair value and a sell stays above it.
+      const Price remainder = out.price % params_.tick_size;
+      if (remainder != 0) {
+        out.price = (side == Side::Buy) ? out.price - remainder
+                                        : out.price + (params_.tick_size - remainder);
+      }
+      // Clamp back inside the band after snapping.
+      if (out.price < params_.min_price) out.price += params_.tick_size;
+      if (out.price > params_.max_price) out.price -= params_.tick_size;
+    }
     out.order_id = next_id_++;
     if (live_ids_.size() < 200'000) live_ids_.push_back(out.order_id);
   } else if (roll < params_.pct_add + params_.pct_cancel) {
@@ -107,6 +119,40 @@ bool SyntheticFeed::write_replay_csv(const std::string& path, Params params, std
     ++n;
   }
   return static_cast<bool>(f);
+}
+
+// -------------------------------------------------------------- MultiSymbolFeed
+
+MultiSymbolFeed::MultiSymbolFeed(std::vector<SyntheticFeed::Params> per_symbol) {
+  feeds_.reserve(per_symbol.size());
+  for (const auto& params : per_symbol) {
+    feeds_.push_back(std::make_unique<SyntheticFeed>(params));
+  }
+}
+
+bool MultiSymbolFeed::next(Tick& out) {
+  if (feeds_.empty()) return false;
+
+  // Round-robin, skipping instruments that have run out. Deterministic, which
+  // is the property that makes a multi-symbol run reproducible at all.
+  for (std::size_t tried = 0; tried < feeds_.size(); ++tried) {
+    const std::size_t index = (cursor_ + tried) % feeds_.size();
+    if (feeds_[index]->next(out)) {
+      cursor_ = (index + 1) % feeds_.size();
+      // Overwrite the per-instrument sequence with the channel's own, matching
+      // how a real multi-instrument feed numbers its messages.
+      out.sequence = ++sequence_;
+      return true;
+    }
+  }
+  return false;
+}
+
+void MultiSymbolFeed::reset() {
+  for (auto& feed : feeds_) feed->reset();
+  cursor_ = 0;
+  exhausted_ = 0;
+  sequence_ = 0;
 }
 
 // --------------------------------------------------------------- CsvReplayFeed

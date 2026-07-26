@@ -17,14 +17,15 @@ std::int64_t PaperVenue::position(SymbolId symbol) const {
 
 // Determines the price this order actually gets, and how much of it fills.
 Price PaperVenue::fill_price_for(const Order& order, Price reference_price, Quantity& filled_qty) {
-  if (cfg_.book != nullptr) {
-    // Cross the real book. The order sweeps resting liquidity, so the average
-    // price depends on how deep it has to reach -- which is what actual
-    // slippage is, rather than a flat bps haircut.
+  OrderBook* book = cfg_.books != nullptr ? cfg_.books->book_for(order.symbol) : nullptr;
+  if (book != nullptr) {
+    // Cross the real book -- this instrument's book. The order sweeps resting
+    // liquidity, so the average price depends on how deep it has to reach,
+    // which is what actual slippage is rather than a flat bps haircut.
     std::vector<Trade> trades;
     trades.reserve(8);
     const OrderId oid = next_venue_order_id_++;
-    const Quantity got = cfg_.book->execute_market(oid, order.side, order.quantity, &trades);
+    const Quantity got = book->execute_market(oid, order.side, order.quantity, &trades);
     if (got > 0) {
       std::int64_t notional = 0;
       for (const auto& t : trades) notional += t.price * t.quantity;

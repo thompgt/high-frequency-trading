@@ -13,6 +13,7 @@
 // Everything runs offline: the default feed is a seeded deterministic
 // generator, so the same command produces the same trades every time.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -235,16 +236,49 @@ int run(int argc, char** argv) {
     return state.ok ? kExitOk : kExitIo;
   }
 
-  SymbolTable symbols;
-  const SymbolId sym = symbols.intern(cfg.symbol);
+  // With no `instrument` lines configured, fall back to the single-symbol
+  // setup: one instrument named by `symbol` over the min/max price band. This
+  // is what every existing config gets, and it keeps the simple case simple.
+  if (cfg.engine.instruments.empty()) {
+    Instrument only;
+    only.symbol = cfg.symbol;
+    only.min_price = cfg.engine.min_price;
+    only.max_price = cfg.engine.max_price;
+    std::string error;
+    if (!cfg.engine.instruments.add(only, error)) {
+      std::fprintf(stderr, "error: %s\n", error.c_str());
+      return kExitConfig;
+    }
+  }
 
-  SyntheticFeed::Params fp;
-  fp.symbol = sym;
-  fp.seed = cfg.seed;
-  fp.total_events = cfg.events;
-  fp.min_price = cfg.engine.min_price;
-  fp.max_price = cfg.engine.max_price;
-  fp.start_price = (cfg.engine.min_price + cfg.engine.max_price) / 2;
+  // The symbol table mirrors the registry so ids agree everywhere. Interning
+  // in registry order is what makes SymbolId usable as a direct index.
+  SymbolTable symbols;
+  for (const auto& instrument : cfg.engine.instruments.all()) {
+    symbols.intern(instrument.symbol);
+  }
+  // One synthetic stream per instrument, each seeded distinctly so adding an
+  // instrument does not change the order flow the others see.
+  std::vector<SyntheticFeed::Params> feed_params;
+  for (const auto& instrument : cfg.engine.instruments.all()) {
+    SyntheticFeed::Params p;
+    p.symbol = instrument.id;
+    p.seed = cfg.seed + instrument.id * 0x9E3779B97F4A7C15ULL;
+    p.total_events = cfg.events / cfg.engine.instruments.size();
+    p.min_price = instrument.min_price;
+    p.max_price = instrument.max_price;
+    p.start_price = (instrument.min_price + instrument.max_price) / 2;
+    // Generated prices must obey the instrument's contract or the engine will
+    // (correctly) reject nearly everything the feed produces.
+    p.tick_size = instrument.tick_size;
+    // Spread orders over the same *number of price levels* regardless of tick
+    // size, so a 25-tick instrument gets real depth rather than two levels.
+    p.tick_range = static_cast<Price>(8) * instrument.tick_size;
+    const Price span = instrument.max_price - instrument.min_price;
+    if (p.tick_range * 4 > span) p.tick_range = std::max<Price>(instrument.tick_size, span / 8);
+    feed_params.push_back(p);
+  }
+  SyntheticFeed::Params fp = feed_params[0];
 
   // --write-replay is a standalone utility mode: produce a capture file, exit.
   if (!replay_out.empty()) {
@@ -330,6 +364,8 @@ int run(int argc, char** argv) {
     std::printf("replaying %zu captured events from %s\n", replay->size(),
                 cfg.replay_path.c_str());
     feed = std::move(replay);
+  } else if (feed_params.size() > 1) {
+    feed = std::make_unique<MultiSymbolFeed>(feed_params);
   } else {
     feed = std::make_unique<SyntheticFeed>(fp);
   }
@@ -410,7 +446,6 @@ int run(int argc, char** argv) {
   }
 
   // --- report --------------------------------------------------------------
-  const OrderBook& book = engine->book();
   const PaperVenue& venue = engine->venue();
 
   std::printf("\n--- pipeline ---\n");
@@ -455,43 +490,54 @@ int run(int argc, char** argv) {
 
   std::printf("\n--- risk ---\n%s", engine->risk().summary().c_str());
 
-  std::printf("\n--- final book ---\n");
-  std::printf("resting orders      : %zu\n", book.live_order_count());
-  const Price bb = book.best_bid();
-  const Price ba = book.best_ask();
-  if (bb != kNoPrice && ba != kNoPrice) {
-    std::printf("best bid            : %.2f x %lld\n", price_to_double(bb),
-                (long long)book.best_bid_quantity());
-    std::printf("best ask            : %.2f x %lld\n", price_to_double(ba),
-                (long long)book.best_ask_quantity());
-    std::printf("spread              : %.2f\n", price_to_double(ba - bb));
-  }
-  std::printf("\ntop of book:\n");
-  const auto bids = book.depth(Side::Buy, 5);
-  const auto asks = book.depth(Side::Sell, 5);
-  std::printf("      %-23s | %s\n", "bid px / qty", "ask px / qty");
-  for (std::size_t i = 0; i < 5; ++i) {
-    char lhs[48] = "";
-    char rhs[48] = "";
-    if (i < bids.size()) {
-      std::snprintf(lhs, sizeof(lhs), "%-12.2f %-10lld", price_to_double(bids[i].price),
-                    (long long)bids[i].quantity);
+  // One section per instrument: with several books, a single merged view would
+  // be meaningless.
+  double marked_equity = venue.realized_pnl();
+  for (const auto& instrument : engine->instruments().all()) {
+    const OrderBook& book = engine->book(instrument.id);
+    std::printf("\n--- final book: %s ---\n", instrument.symbol.c_str());
+    std::printf("resting orders      : %zu\n", book.live_order_count());
+    const Price bb = book.best_bid();
+    const Price ba = book.best_ask();
+    if (bb != kNoPrice && ba != kNoPrice) {
+      std::printf("best bid            : %.2f x %lld\n", price_to_double(bb),
+                  (long long)book.best_bid_quantity());
+      std::printf("best ask            : %.2f x %lld\n", price_to_double(ba),
+                  (long long)book.best_ask_quantity());
+      std::printf("spread              : %.2f\n", price_to_double(ba - bb));
     }
-    if (i < asks.size()) {
-      std::snprintf(rhs, sizeof(rhs), "%-12.2f %-10lld", price_to_double(asks[i].price),
-                    (long long)asks[i].quantity);
+    std::printf("position            : %lld\n", (long long)venue.position(instrument.id));
+
+    std::printf("\ntop of book:\n");
+    const auto bids = book.depth(Side::Buy, 5);
+    const auto asks = book.depth(Side::Sell, 5);
+    std::printf("      %-23s | %s\n", "bid px / qty", "ask px / qty");
+    for (std::size_t i = 0; i < 5; ++i) {
+      char lhs[48] = "";
+      char rhs[48] = "";
+      if (i < bids.size()) {
+        std::snprintf(lhs, sizeof(lhs), "%-12.2f %-10lld", price_to_double(bids[i].price),
+                      (long long)bids[i].quantity);
+      }
+      if (i < asks.size()) {
+        std::snprintf(rhs, sizeof(rhs), "%-12.2f %-10lld", price_to_double(asks[i].price),
+                      (long long)asks[i].quantity);
+      }
+      std::printf("      %-23s | %s\n", lhs, rhs);
     }
-    std::printf("      %-23s | %s\n", lhs, rhs);
+
+    // Mark each instrument's inventory at its own mid. Marking one product at
+    // another's price is how a book that is actually flat shows a profit.
+    if (bb != kNoPrice && ba != kNoPrice && venue.position(instrument.id) != 0) {
+      marked_equity += venue.equity(instrument.id, (bb + ba) / 2) - venue.realized_pnl();
+    }
   }
 
   std::printf("\n--- paper trading ---\n");
   std::printf("fills               : %llu\n", (unsigned long long)venue.fill_count());
-  std::printf("position %-11s: %lld\n", cfg.symbol.c_str(), (long long)venue.position(sym));
   std::printf("realized pnl        : %.2f\n", venue.realized_pnl());
   std::printf("fees paid           : %.2f\n", venue.fees_paid());
-  if (bb != kNoPrice && ba != kNoPrice) {
-    std::printf("equity (marked mid) : %.2f\n", venue.equity(sym, (bb + ba) / 2));
-  }
+  std::printf("equity (marked mid) : %.2f\n", marked_equity);
 
   std::printf("\n--- latency (ns, one dev machine, not production hardware) ---\n");
   std::printf("%s", engine->latency().summary().c_str());

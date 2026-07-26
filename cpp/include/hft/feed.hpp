@@ -59,6 +59,10 @@ class SyntheticFeed : public MarketDataSource {
     int pct_move = 12;
     Price min_price = 5000;
     Price max_price = 15000;
+    // Generated prices are snapped to this grid. Must match the instrument's
+    // tick size, or the engine's contract check will (correctly) reject almost
+    // every message the feed produces.
+    Price tick_size = 1;
   };
 
   explicit SyntheticFeed(Params params);
@@ -83,6 +87,32 @@ class SyntheticFeed : public MarketDataSource {
   std::size_t emitted_ = 0;
   OrderId next_id_ = 1;
   std::vector<OrderId> live_ids_;  // pool of ids eligible to be cancelled
+};
+
+// Interleaves several SyntheticFeeds into one stream, the way a real
+// multi-instrument channel does.
+//
+// The sequence number is assigned by the *channel*, not by the instrument,
+// because that is how venues do it: one monotonic counter across every symbol
+// on the feed, so a gap is detectable without having to reason about which
+// symbol was supposed to be next.
+class MultiSymbolFeed : public MarketDataSource {
+ public:
+  // One entry per instrument. Each gets its own PRNG stream, so adding an
+  // instrument does not change the order flow the others see.
+  explicit MultiSymbolFeed(std::vector<SyntheticFeed::Params> per_symbol);
+
+  bool next(Tick& out) override;
+  void reset() override;
+  const char* name() const override { return "MultiSymbolFeed"; }
+
+  std::size_t symbol_count() const { return feeds_.size(); }
+
+ private:
+  std::vector<std::unique_ptr<SyntheticFeed>> feeds_;
+  std::size_t cursor_ = 0;      // round-robin position
+  std::size_t exhausted_ = 0;   // feeds that have run out
+  std::uint64_t sequence_ = 0;  // channel-wide, not per symbol
 };
 
 // Replays a CSV file produced by SyntheticFeed::write_replay_csv (or by any

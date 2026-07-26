@@ -119,6 +119,13 @@ class RiskManager {
   void set_exposure_source(const ExposureSource* source) { exposure_ = source; }
   const ExposureSource* exposure_source() const { return exposure_; }
 
+  // Per-instrument position ceiling. A limit that suits a liquid future is
+  // reckless on a thin name, so an instrument may carry its own. The value is
+  // clamped to the global limit and can therefore only ever tighten it -- a
+  // config mistake must not be able to widen a risk limit.
+  void set_symbol_limit(SymbolId symbol, std::int64_t max_position);
+  std::int64_t symbol_limit(SymbolId symbol) const;
+
   // Call after every fill so inventory and drawdown stay current. Breaching
   // the drawdown limit engages the kill switch from here.
   void on_fill(const Fill& fill);
@@ -162,6 +169,8 @@ class RiskManager {
   RiskLimits limits_;
   const ExposureSource* exposure_ = nullptr;
   std::vector<std::int64_t> positions_;  // indexed by SymbolId, grown on demand
+  // Per-symbol position ceilings. 0 means "use the global limit".
+  std::vector<std::int64_t> symbol_limits_;
   std::int64_t gross_position_ = 0;
 
   double peak_equity_ = 0.0;

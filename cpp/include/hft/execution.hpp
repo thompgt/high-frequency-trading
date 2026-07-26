@@ -24,6 +24,28 @@
 
 namespace hft {
 
+// Supplies the book to fill against, per instrument. An interface rather than a
+// raw pointer because the engine keeps one book per instrument, and the venue
+// must fill each order against its own instrument's depth -- crossing an order
+// against the wrong book would produce fills at prices that never existed.
+class BookProvider {
+ public:
+  virtual ~BookProvider() = default;
+  // Null for a symbol with no book, in which case the venue falls back to the
+  // reference-price model rather than inventing a fill.
+  virtual OrderBook* book_for(SymbolId symbol) = 0;
+};
+
+// One book for everything. For single-instrument setups and tests.
+class SingleBookProvider : public BookProvider {
+ public:
+  explicit SingleBookProvider(OrderBook* book) : book_(book) {}
+  OrderBook* book_for(SymbolId) override { return book_; }
+
+ private:
+  OrderBook* book_;
+};
+
 class ExecutionVenue {
  public:
   virtual ~ExecutionVenue() = default;
@@ -38,10 +60,11 @@ class PaperVenue : public ExecutionVenue {
   struct Config {
     double slippage_bps = 1.0;
     double fee_bps = 0.5;
-    // When set, marketable orders are matched against this book and the fill
-    // price is the volume-weighted price actually obtained. When null, the
-    // venue falls back to reference_price +/- slippage, exactly like paper.py.
-    OrderBook* book = nullptr;
+    // When set, marketable orders are matched against the order's own
+    // instrument book and the fill price is the volume-weighted price actually
+    // obtained. When null, the venue falls back to reference_price +/-
+    // slippage, exactly like paper.py.
+    BookProvider* books = nullptr;
   };
 
   struct PnlPoint {
@@ -71,6 +94,9 @@ class PaperVenue : public ExecutionVenue {
 
   const std::vector<PnlPoint>& equity_curve() const { return curve_; }
   void set_record_curve(bool on) { record_curve_ = on; }
+  // Set after construction by owners (like Engine) whose book provider is a
+  // member and therefore cannot be passed to their own member's constructor.
+  void set_books(BookProvider* books) { cfg_.books = books; }
 
   bool write_fills_csv(const std::string& path) const;
 

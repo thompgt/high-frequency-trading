@@ -8,11 +8,14 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "hft/execution.hpp"
 #include "hft/feed.hpp"
 #include "hft/feed_health.hpp"
+#include "hft/instrument.hpp"
 #include "hft/journal.hpp"
 #include "hft/latency.hpp"
 #include "hft/oms.hpp"
@@ -30,6 +33,10 @@ struct EngineConfig {
   Quantity order_quantity = 1;
   double slippage_bps = 1.0;
   double fee_bps = 0.5;
+  // The instruments to trade, one book each. When empty the engine creates a
+  // single instrument spanning [min_price, max_price] below, which is what
+  // every single-symbol configuration gets and keeps that case a one-liner.
+  InstrumentRegistry instruments;
   Price min_price = 5000;
   Price max_price = 15000;
   std::size_t ring_capacity = 1 << 16;
@@ -78,6 +85,13 @@ struct EngineStats {
   std::uint64_t stale_messages = 0;
   // Ticks not traded on because the feed session was faulted.
   std::uint64_t ticks_while_faulted = 0;
+  // Messages for a symbol we have no instrument for. A feed sending us
+  // something we never subscribed to is a configuration or entitlement
+  // problem, not something to guess our way through.
+  std::uint64_t unknown_symbol_ticks = 0;
+  // Messages whose price or quantity violated the instrument's contract
+  // (off the tick grid, off the lot size, outside the band).
+  std::uint64_t contract_violations = 0;
   bool halted = false;
   Nanos wall_ns = 0;
 
@@ -93,8 +107,17 @@ class Engine {
   // Drains `feed` to exhaustion and returns run statistics.
   EngineStats run(MarketDataSource& feed);
 
-  OrderBook& book() { return book_; }
-  const OrderBook& book() const { return book_; }
+  // Per-instrument book. Throws std::out_of_range for an unknown symbol --
+  // a caller asking for a book that does not exist has a bug, and returning a
+  // reference to something arbitrary would hide it.
+  OrderBook& book(SymbolId symbol);
+  const OrderBook& book(SymbolId symbol) const;
+  // The first instrument's book. Convenience for the single-instrument case,
+  // which is most configurations and every benchmark.
+  OrderBook& book() { return book(0); }
+  const OrderBook& book() const { return book(0); }
+  std::size_t book_count() const { return books_.size(); }
+  const InstrumentRegistry& instruments() const { return instruments_; }
   PaperVenue& venue() { return venue_; }
   const PaperVenue& venue() const { return venue_; }
   MovingAverageCrossover& strategy() { return strategy_; }
@@ -144,8 +167,23 @@ class Engine {
   // recovery, which is the one ordering that loses information.
   void emit(const ExecutionReport& report, EngineStats& stats);
 
+  // Hands the venue the right book for each order's instrument.
+  class Books : public BookProvider {
+   public:
+    explicit Books(Engine* engine) : engine_(engine) {}
+    OrderBook* book_for(SymbolId symbol) override;
+
+   private:
+    Engine* engine_;
+  };
+
   EngineConfig cfg_;
-  OrderBook book_;
+  InstrumentRegistry instruments_;
+  // One book per instrument, indexed by SymbolId. Held by pointer because
+  // OrderBook is neither copyable nor movable (it hands out interior
+  // references) and the vector must not reallocate its elements.
+  std::vector<std::unique_ptr<OrderBook>> books_;
+  Books book_provider_{this};
   MovingAverageCrossover strategy_;
   PaperVenue venue_;
   RiskManager risk_;
@@ -156,7 +194,9 @@ class Engine {
   std::vector<Trade> trade_scratch_;  // reused so matching never allocates
   Journal* journal_ = nullptr;
   OrderId next_order_id_ = 1;
-  Price last_reference_ = 0;  // last usable fair value, for flattening
+  // Last usable fair value per instrument, for flattening. Per symbol because
+  // one instrument's price says nothing about another's.
+  std::vector<Price> last_reference_;
   std::atomic<bool> stop_requested_{false};
 };
 

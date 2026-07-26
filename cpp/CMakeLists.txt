@@ -64,6 +64,7 @@ add_executable(hft_tests
   tests/test_journal.cpp
   tests/test_feed_health.cpp
   tests/test_instrument.cpp
+  tests/test_multi_instrument.cpp
 )
 target_include_directories(hft_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(hft_tests PRIVATE hft_core)
