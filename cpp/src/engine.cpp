@@ -4,7 +4,15 @@
 #include <fstream>
 #include <thread>
 
+#include "hft/log.hpp"
+
 namespace hft {
+namespace {
+// Ticks between clock reads in the run loops. Reading the clock is far more
+// expensive than the counter that guards it, and the sweep itself only needs
+// to be roughly periodic -- the ack timeout is measured in whole seconds.
+constexpr std::uint64_t kSweepCheckTicks = 1024;
+}  // namespace
 
 Engine::Engine(EngineConfig config)
     : cfg_(config),
@@ -349,6 +357,45 @@ std::uint64_t Engine::flatten(EngineStats& stats) {
   return sent;
 }
 
+std::size_t Engine::sweep_orders(Nanos now, EngineStats& stats, bool force) {
+  if (!force) {
+    if (last_sweep_ns_ == 0) {
+      // First call: start the clock rather than immediately sweeping, so an
+      // order sent in the first microsecond of a run is not judged against a
+      // timeout that began at the epoch.
+      last_sweep_ns_ = now;
+      return 0;
+    }
+    if (now - last_sweep_ns_ < cfg_.order_sweep_interval_ns) return 0;
+  }
+  last_sweep_ns_ = now;
+
+  expired_scratch_.clear();
+  const std::size_t expired = oms_.sweep_timeouts(now, &expired_scratch_);
+  if (expired == 0) return 0;
+
+  stats.timed_out_orders += expired;
+  for (const ClOrdId id : expired_scratch_) {
+    // Logged individually and at error level: each one is an order whose state
+    // at the venue is unknown, and the ids are what an operator needs to query
+    // it with.
+    HFT_ERROR("order timed out with no acknowledgement", "cl_ord_id",
+              static_cast<double>(id));
+  }
+
+  // An unanswered order may be resting at the venue or may have died on the
+  // wire, and those demand opposite actions. Neither is something to keep
+  // quoting through, so by default this stops trading and lets a human decide.
+  if (cfg_.halt_on_order_timeout && !risk_.halted()) {
+    risk_.engage_kill_switch(HaltReason::OrderTimeout);
+    stats.halted = true;
+    if (journal_ != nullptr) {
+      journal_->record_halt(static_cast<std::uint8_t>(HaltReason::OrderTimeout), now);
+    }
+  }
+  return expired;
+}
+
 EngineStats Engine::run(MarketDataSource& feed) {
   return cfg_.threaded ? run_threaded(feed) : run_inline(feed);
 }
@@ -357,7 +404,18 @@ EngineStats Engine::run_inline(MarketDataSource& feed) {
   EngineStats stats;
   Tick tick;
   const Nanos t0 = now_ns();
-  while (!stop_requested() && feed.next(tick)) process(tick, stats);
+  last_sweep_ns_ = t0;
+  std::uint64_t since_sweep = 0;
+  while (!stop_requested() && feed.next(tick)) {
+    process(tick, stats);
+    // Checking the clock every tick would cost more than the sweep it guards,
+    // so the counter gates the clock read and the clock gates the sweep.
+    if (++since_sweep >= kSweepCheckTicks) {
+      since_sweep = 0;
+      sweep_orders(now_ns(), stats);
+    }
+  }
+  sweep_orders(now_ns(), stats, /*force=*/true);
   stats.wall_ns = now_ns() - t0;
   return stats;
 }
@@ -380,10 +438,18 @@ EngineStats Engine::run_threaded(MarketDataSource& feed) {
     producer_done.store(true, std::memory_order_release);
   });
 
+  last_sweep_ns_ = t0;
+  std::uint64_t since_sweep = 0;
   Tick tick;
   for (;;) {
     if (ring_.try_pop(tick)) {
       process(tick, stats);
+      // A busy consumer may never reach the idle branch below, so the sweep
+      // cannot live there alone.
+      if (++since_sweep >= kSweepCheckTicks) {
+        since_sweep = 0;
+        sweep_orders(now_ns(), stats);
+      }
       continue;
     }
     if (producer_done.load(std::memory_order_acquire) && ring_.empty_approx()) break;
@@ -393,16 +459,21 @@ EngineStats Engine::run_threaded(MarketDataSource& feed) {
     // stopped sending will never call process() to say so. A frozen book and a
     // quiet market are indistinguishable from inside, and only one of them is
     // safe to quote against.
-    if (feed_.check_stale(now_ns()) && !risk_.halted()) {
+    const Nanos idle_now = now_ns();
+    if (feed_.check_stale(idle_now) && !risk_.halted()) {
       risk_.engage_kill_switch(HaltReason::Manual);
       stats.halted = true;
       if (journal_ != nullptr) {
-        journal_->record_halt(static_cast<std::uint8_t>(HaltReason::Manual), now_ns());
+        journal_->record_halt(static_cast<std::uint8_t>(HaltReason::Manual), idle_now);
       }
     }
+    // Idle is also where an unanswered order is most likely to be noticed: a
+    // venue that has stopped responding is also a venue sending us nothing.
+    sweep_orders(idle_now, stats);
     std::this_thread::yield();
   }
 
+  sweep_orders(now_ns(), stats, /*force=*/true);
   producer.join();
   stats.wall_ns = now_ns() - t0;
   stats.dropped_ticks = ring_.dropped();

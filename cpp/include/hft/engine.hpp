@@ -56,6 +56,19 @@ struct EngineConfig {
   // Market data session validation. A gap means the book is missing updates
   // and is therefore wrong; by default that stops trading.
   FeedHealthConfig feed_health;
+
+  // How often to sweep for orders that were never acknowledged. The sweep is
+  // what turns "no response yet" into a counted, named outcome instead of an
+  // order that holds working exposure forever, so it has to run on a clock and
+  // not only when the next report happens to arrive.
+  Nanos order_sweep_interval_ns = 100'000'000;  // 100ms
+
+  // Whether an unacknowledged order stops trading. Default true: the ack
+  // timeout is set well beyond any healthy round trip, so tripping it means we
+  // do not know whether an order is live at the venue -- and continuing to
+  // quote on top of a position we cannot bound is the mistake this engine is
+  // built to make impossible.
+  bool halt_on_order_timeout = true;
 };
 
 struct EngineStats {
@@ -92,6 +105,9 @@ struct EngineStats {
   // Messages whose price or quantity violated the instrument's contract
   // (off the tick grid, off the lot size, outside the band).
   std::uint64_t contract_violations = 0;
+  // Orders that went unanswered past the ack timeout. Every one of them is an
+  // order whose state at the venue we do not know.
+  std::uint64_t timed_out_orders = 0;
   bool halted = false;
   Nanos wall_ns = 0;
 
@@ -135,6 +151,15 @@ class Engine {
   // engine deterministically without a feed or a thread.
   void process(const Tick& tick, EngineStats& stats);
 
+  // Runtime housekeeping that is driven by the clock rather than by market
+  // data: expiring orders the venue never answered. Both run loops call it, and
+  // it is public so a test can drive it without one. `now_ns` is passed in so
+  // the timing is deterministic under test.
+  //
+  // Rate-limited internally to config().order_sweep_interval_ns; pass
+  // `force = true` to sweep regardless.
+  std::size_t sweep_orders(Nanos now_ns, EngineStats& stats, bool force = false);
+
   // Attaches a journal. Not owned; must outlive the engine. Every order and
   // every execution report is written to it before being acted on, so a crash
   // leaves a record of what was actually in flight.
@@ -176,6 +201,11 @@ class Engine {
    private:
     Engine* engine_;
   };
+
+  // Scratch for sweep_orders(), so expiring orders never allocates on a path
+  // that runs every 100ms.
+  std::vector<ClOrdId> expired_scratch_;
+  Nanos last_sweep_ns_ = 0;
 
   EngineConfig cfg_;
   InstrumentRegistry instruments_;

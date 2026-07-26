@@ -168,6 +168,7 @@ did we stop?" is always answerable.
 |---|---|---|
 | `drawdown_breach` | Peak-to-trough equity exceeded `max_drawdown` | The strategy is losing. This is the limit working. Do not raise it to get back in. |
 | `daily_order_limit` | `max_daily_orders` reached | Usually a runaway strategy loop, occasionally a genuinely busy day. Check `orders sent` against the throughput you expected. |
+| `order_timeout` | An order went past `ack_timeout_ms` with no response | We do not know whether it is resting at the venue or died on the wire. Query the venue by the `cl_ord_id` in the error log before restarting. |
 | `manual` | Feed fault, or a journal write failure | See the two sections below — the cause is in the run report. |
 
 On halt the engine stops taking new risk and, if `flatten_on_exit` is set,
@@ -277,7 +278,7 @@ From `metrics.json` in `--out-dir`. Ranked by how quickly you want to know.
 |---|---|---|
 | `feed.gaps` | `> 0` | Even a tolerated gap means messages were lost. |
 | `feed.stale_events` | `> 0` | The feed went quiet. |
-| `orders.expired` | `> 0` | Orders went unacknowledged past the timeout — venue latency or a dropped session. |
+| `orders.expired` / `trading.timed_out_orders` | `> 0` | Orders went unacknowledged past the timeout — venue latency or a dropped session. With `halt_on_order_timeout` on (the default) this also halts, so it will normally arrive alongside `risk.halted`. |
 | `run.dropped_ticks` | `> 0` | The engine could not keep up with its own feed. |
 | `orders.adopted` | `> 0` | This session inherited live orders from the last one. Expected after a reconciled restart; unexplained otherwise. |
 | `risk.rejects_by_reason.*` | any sustained non-zero | Each reason names a specific misconfiguration or strategy bug. |

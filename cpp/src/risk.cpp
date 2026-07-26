@@ -31,6 +31,7 @@ const char* to_string(HaltReason r) {
     case HaltReason::Manual: return "manual";
     case HaltReason::DrawdownBreach: return "drawdown_breach";
     case HaltReason::DailyOrderLimit: return "daily_order_limit";
+    case HaltReason::OrderTimeout: return "order_timeout";
     case HaltReason::kCount: break;
   }
   return "unknown";

@@ -73,7 +73,8 @@ const std::vector<std::string>& config_keys() {
       "max_position_per_symbol", "max_gross_position", "price_collar_bps",
       "max_orders_per_second", "max_daily_orders", "max_drawdown",
       // order management
-      "max_open_orders", "ack_timeout_ms", "order_history",
+      "max_open_orders", "ack_timeout_ms", "order_history", "order_sweep_ms",
+      "halt_on_order_timeout",
       // market data session health
       "feed_require_sequence", "feed_halt_on_gap", "feed_tolerated_gap", "feed_stale_ms",
       // durability
@@ -242,6 +243,12 @@ bool apply_config_setting(const std::string& key, const std::string& value, AppC
   } else if (key == "order_history") {
     if (!need_i64("order_history") || !need_positive("order_history", i)) return false;
     cfg.engine.oms.retired_history = static_cast<std::size_t>(i);
+  } else if (key == "order_sweep_ms") {
+    if (!need_i64("order_sweep_ms") || !need_positive("order_sweep_ms", i)) return false;
+    cfg.engine.order_sweep_interval_ns = static_cast<Nanos>(i) * 1'000'000;
+  } else if (key == "halt_on_order_timeout") {
+    if (!need_bool("halt_on_order_timeout")) return false;
+    cfg.engine.halt_on_order_timeout = b;
 
     // --- market data session health -----------------------------------------
   } else if (key == "feed_require_sequence") {
@@ -417,6 +424,9 @@ std::string describe_config(const AppConfig& cfg) {
      << "  max_open_orders         = " << cfg.engine.oms.max_open_orders << "\n"
      << "  ack_timeout_ms          = " << (cfg.engine.oms.ack_timeout_ns / 1'000'000) << "\n"
      << "  order_history           = " << cfg.engine.oms.retired_history << "\n"
+     << "  order_sweep_ms          = " << (cfg.engine.order_sweep_interval_ns / 1'000'000) << "\n"
+     << "  halt_on_order_timeout   = " << (cfg.engine.halt_on_order_timeout ? "true" : "false")
+     << "\n"
      << "  feed_require_sequence   = "
      << (cfg.engine.feed_health.require_sequence ? "true" : "false") << "\n"
      << "  feed_halt_on_gap        = "

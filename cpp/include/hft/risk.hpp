@@ -46,6 +46,10 @@ enum class HaltReason : std::uint8_t {
   Manual,
   DrawdownBreach,
   DailyOrderLimit,
+  // An order went unacknowledged past the ack timeout, so its state at the
+  // venue is unknown. Quoting on top of a position we cannot bound is worse
+  // than stopping.
+  OrderTimeout,
   kCount
 };
 

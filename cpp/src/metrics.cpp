@@ -103,6 +103,7 @@ std::string metrics_json(const Engine& engine, const EngineStats& stats,
      << "    \"risk_rejects\": " << stats.risk_rejects << ",\n"
      << "    \"untracked_rejects\": " << stats.untracked_rejects << ",\n"
      << "    \"partial_fills\": " << stats.partial_fills << ",\n"
+     << "    \"timed_out_orders\": " << stats.timed_out_orders << ",\n"
      << "    \"flatten_orders\": " << stats.flatten_orders << ",\n"
      << "    \"fills\": " << venue.fill_count() << ",\n"
      << "    \"realized_pnl\": " << venue.realized_pnl() << ",\n"

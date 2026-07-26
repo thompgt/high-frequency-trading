@@ -67,6 +67,7 @@ add_executable(hft_tests
   tests/test_instrument.cpp
   tests/test_multi_instrument.cpp
   tests/test_reconcile.cpp
+  tests/test_order_timeout.cpp
 )
 target_include_directories(hft_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(hft_tests PRIVATE hft_core)
