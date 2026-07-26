@@ -41,6 +41,11 @@ LIB_SRCS := $(wildcard src/*.cpp)
 LIB_SRCS := $(filter-out src/main.cpp,$(LIB_SRCS))
 LIB_OBJS := $(patsubst src/%.cpp,$(BUILD)/obj/%.o,$(LIB_SRCS))
 
+# The test suite is split across translation units by subsystem; tests_main.cpp
+# holds the runner's main().
+TEST_SRCS := $(wildcard tests/*.cpp)
+TEST_OBJS := $(patsubst tests/%.cpp,$(BUILD)/obj/test_%.o,$(TEST_SRCS))
+
 ENGINE_BIN := $(BUILD)/hft_engine
 TEST_BIN   := $(BUILD)/hft_tests
 BENCH_BIN  := $(BUILD)/hft_bench
@@ -58,7 +63,7 @@ $(BUILD)/obj/%.o: src/%.cpp | dirs
 $(BUILD)/obj/main.o: src/main.cpp | dirs
 	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
-$(BUILD)/obj/tests_main.o: tests/tests_main.cpp | dirs
+$(BUILD)/obj/test_%.o: tests/%.cpp | dirs
 	$(CXX) $(CXXFLAGS) -Itests -MMD -MP -c $< -o $@
 
 $(BUILD)/obj/bench_main.o: bench/bench_main.cpp | dirs
@@ -67,7 +72,7 @@ $(BUILD)/obj/bench_main.o: bench/bench_main.cpp | dirs
 $(ENGINE_BIN): $(LIB_OBJS) $(BUILD)/obj/main.o
 	$(CXX) $^ -o $@ $(LDFLAGS) $(LDLIBS)
 
-$(TEST_BIN): $(LIB_OBJS) $(BUILD)/obj/tests_main.o
+$(TEST_BIN): $(LIB_OBJS) $(TEST_OBJS)
 	$(CXX) $^ -o $@ $(LDFLAGS) $(LDLIBS)
 
 $(BENCH_BIN): $(LIB_OBJS) $(BUILD)/obj/bench_main.o
@@ -97,7 +102,7 @@ clean:
 # the optimised build.
 
 SAN_CXXFLAGS := -std=$(CXXSTD) -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Wpedantic -Werror -Iinclude -Itests
-SAN_SRCS := $(LIB_SRCS) tests/tests_main.cpp
+SAN_SRCS := $(LIB_SRCS) $(TEST_SRCS)
 
 .PHONY: asan ubsan tsan hardened sanitizers
 
