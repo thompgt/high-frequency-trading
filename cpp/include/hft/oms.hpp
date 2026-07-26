@@ -124,6 +124,8 @@ struct OmsStats {
   std::uint64_t cancel_rejected = 0;
   std::uint64_t venue_rejected = 0;
   std::uint64_t expired = 0;
+  // Orders taken over from a venue snapshot rather than originated here.
+  std::uint64_t adopted = 0;
 
   // --- reconciliation breaks ---
   std::uint64_t unknown_reports = 0;      // no such order, and not recently retired
@@ -176,6 +178,17 @@ class OrderManager : public ExposureSource {
   // originate. Returns 0 if the id is zero, already tracked, or there is no
   // capacity.
   ClOrdId create_with_id(ClOrdId id, const Order& order, Nanos now_ns);
+
+  // Takes responsibility for an order that already exists at the venue, in the
+  // state the venue says it is in rather than as PendingNew. This is what a
+  // restart does with the orders that startup reconciliation confirmed are
+  // still resting: until they are here, they are live risk that no limit can
+  // see and no cancel can reach.
+  //
+  // `snapshot` must carry a non-zero id, a positive quantity and a non-terminal
+  // state; anything else returns 0 and is counted as a capacity reject, because
+  // adopting a finished order would track exposure that does not exist.
+  ClOrdId adopt(const OrderRecord& snapshot, Nanos now_ns);
 
   // Sets the id the next create() will hand out. Client order ids must be
   // unique across restarts -- a venue that sees the same id twice in a session

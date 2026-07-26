@@ -161,6 +161,51 @@ ClOrdId OrderManager::create_with_id(ClOrdId id, const Order& order, Nanos now_n
   return id;
 }
 
+ClOrdId OrderManager::adopt(const OrderRecord& snapshot, Nanos now_ns) {
+  if (is_terminal(snapshot.state)) {
+    // A finished order has no leaves and nothing to cancel. Tracking it would
+    // put exposure in the book that cannot ever be worked off.
+    ++stats_.capacity_rejects;
+    return 0;
+  }
+  Order order;
+  order.symbol = snapshot.symbol;
+  order.side = snapshot.side;
+  order.type = snapshot.type;
+  order.price = snapshot.price;
+  order.quantity = snapshot.quantity;
+  order.created_ts_ns = now_ns;
+  const ClOrdId id = create_with_id(snapshot.cl_ord_id, order, now_ns);
+  if (id == 0) return 0;  // create_with_id has already counted the reason
+
+  OrderRecord& rec = pool_[slot_for(id)];
+  // create_with_id booked the full quantity as working, which is right for a
+  // new order and wrong for a partly-filled one. Correct it to what the venue
+  // says is actually left.
+  Quantity leaves = snapshot.leaves;
+  if (leaves < 0) leaves = 0;
+  if (leaves > rec.quantity) leaves = rec.quantity;
+  add_exposure(rec.symbol, rec.side, leaves - rec.leaves);
+  rec.leaves = leaves;
+  rec.filled = std::min(snapshot.filled < 0 ? 0 : snapshot.filled, rec.quantity);
+  rec.venue_order_id = snapshot.venue_order_id;
+  rec.avg_fill_price = snapshot.avg_fill_price;
+  rec.fees = snapshot.fees;
+  rec.state = snapshot.state;
+  rec.created_ts_ns = snapshot.created_ts_ns != 0 ? snapshot.created_ts_ns : now_ns;
+  // An adopted order is live at the venue by definition, so it is acked as far
+  // as the timeout sweep is concerned -- expiring it would be claiming it never
+  // arrived when we have just been told it did.
+  rec.acked_ts_ns = now_ns;
+  rec.last_update_ts_ns = now_ns;
+
+  // It was not created here; it was inherited. Keeping the two apart is what
+  // lets `created` stay a count of orders this session actually sent.
+  --stats_.created;
+  ++stats_.adopted;
+  return id;
+}
+
 void OrderManager::retire(std::uint32_t slot) {
   OrderRecord& rec = pool_[slot];
   // Whatever was still working is not working any more.
@@ -405,6 +450,7 @@ std::string OrderManager::summary() const {
                 "  cancelled         : %llu  (%llu requested, %llu cancel rejects)\n"
                 "  venue rejected    : %llu\n"
                 "  expired (no ack)  : %llu\n"
+                "adopted from venue  : %llu\n"
                 "working orders      : %zu\n"
                 "gross working qty   : %lld\n"
                 "reconciliation breaks: %llu"
@@ -414,7 +460,7 @@ std::string OrderManager::summary() const {
                 (unsigned long long)stats_.cancelled, (unsigned long long)stats_.cancels_requested,
                 (unsigned long long)stats_.cancel_rejected,
                 (unsigned long long)stats_.venue_rejected, (unsigned long long)stats_.expired,
-                open_count_, (long long)gross_exposure_, (unsigned long long)stats_.breaks(),
+                (unsigned long long)stats_.adopted, open_count_, (long long)gross_exposure_, (unsigned long long)stats_.breaks(),
                 (unsigned long long)stats_.unknown_reports,
                 (unsigned long long)stats_.invalid_transitions,
                 (unsigned long long)stats_.overfills, (unsigned long long)stats_.capacity_rejects,
