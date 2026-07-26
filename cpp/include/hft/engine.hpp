@@ -12,6 +12,7 @@
 
 #include "hft/execution.hpp"
 #include "hft/feed.hpp"
+#include "hft/journal.hpp"
 #include "hft/latency.hpp"
 #include "hft/oms.hpp"
 #include "hft/order_book.hpp"
@@ -64,6 +65,10 @@ struct EngineStats {
   // market order does not rest, so its unfilled remainder is dead the moment
   // the venue answers -- leaving it "working" would leak exposure forever.
   std::uint64_t partial_fills = 0;
+  // Journal writes that failed. Any of these is fatal to the run: an engine
+  // that cannot record what it did cannot be recovered after a crash, so it
+  // halts rather than trading blind.
+  std::uint64_t journal_failures = 0;
   bool halted = false;
   Nanos wall_ns = 0;
 
@@ -96,6 +101,12 @@ class Engine {
   // engine deterministically without a feed or a thread.
   void process(const Tick& tick, EngineStats& stats);
 
+  // Attaches a journal. Not owned; must outlive the engine. Every order and
+  // every execution report is written to it before being acted on, so a crash
+  // leaves a record of what was actually in flight.
+  void set_journal(Journal* journal) { journal_ = journal; }
+  Journal* journal() { return journal_; }
+
   bool write_book_snapshot_csv(const std::string& path, std::size_t levels) const;
 
   // Closes out inventory. Used on shutdown and when the kill switch trips:
@@ -117,6 +128,11 @@ class Engine {
   Fill dispatch(const Order& order, Price reference_price, ClOrdId cl_ord_id,
                 EngineStats& stats);
 
+  // Applies a report to the OMS and writes it to the journal. Journalling
+  // first: a report we have acted on but not recorded is invisible to
+  // recovery, which is the one ordering that loses information.
+  void emit(const ExecutionReport& report, EngineStats& stats);
+
   EngineConfig cfg_;
   OrderBook book_;
   MovingAverageCrossover strategy_;
@@ -126,6 +142,7 @@ class Engine {
   LatencyRecorder latency_;
   SpscRingBuffer<Tick> ring_;
   std::vector<Trade> trade_scratch_;  // reused so matching never allocates
+  Journal* journal_ = nullptr;
   OrderId next_order_id_ = 1;
   Price last_reference_ = 0;  // last usable fair value, for flattening
   std::atomic<bool> stop_requested_{false};

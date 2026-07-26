@@ -42,6 +42,10 @@ constexpr int kExitUsage = 2;
 constexpr int kExitConfig = 3;
 constexpr int kExitIo = 4;
 constexpr int kExitRuntime = 5;
+// The previous session left state that needs a human decision before trading
+// resumes. Distinct from every other failure so a supervisor does not simply
+// restart into the same situation.
+constexpr int kExitUnclean = 6;
 
 // The only thing a signal handler may safely touch.
 volatile std::sig_atomic_t g_stop_requested = 0;
@@ -63,6 +67,9 @@ void usage(const char* argv0) {
       "  --replay FILE         replay a captured CSV instead of generating\n"
       "  --write-replay FILE   write a deterministic replay CSV and exit\n"
       "  --replay-events N     rows to write with --write-replay (default 200000)\n"
+      "  --journal FILE        append every order and fill here, for crash recovery\n"
+      "  --recover FILE        replay a journal, print what it recovers, and exit\n"
+      "  --allow-unclean-start start even if the last session did not exit cleanly\n"
       "  --out-dir DIR         write metrics.json and CSVs here\n"
       "  --inline              run single-threaded (no ring hand-off)\n"
       "  --threaded            run the feed on its own thread\n"
@@ -79,8 +86,8 @@ void usage(const char* argv0) {
 // Returns false if the CLI was malformed; `exit_now` requests a clean early
 // exit (e.g. --help).
 bool parse_cli(int argc, char** argv, AppConfig& cfg, std::string& config_path,
-               std::string& replay_out, std::size_t& replay_out_events, bool& exit_now,
-               int& exit_code) {
+               std::string& replay_out, std::size_t& replay_out_events, std::string& recover_path,
+               bool& exit_now, int& exit_code) {
   std::vector<std::pair<std::string, std::string>> overrides;
   bool print_config = false;
 
@@ -120,6 +127,12 @@ bool parse_cli(int argc, char** argv, AppConfig& cfg, std::string& config_path,
         return false;
       }
       overrides.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
+    } else if (a == "--journal") {
+      overrides.emplace_back("journal_path", need("--journal"));
+    } else if (a == "--recover") {
+      recover_path = need("--recover");
+    } else if (a == "--allow-unclean-start") {
+      overrides.emplace_back("allow_unclean_start", "true");
     } else if (a == "--write-replay") {
       replay_out = need("--write-replay");
     } else if (a == "--replay-events") {
@@ -202,15 +215,25 @@ int run(int argc, char** argv) {
   AppConfig cfg;
   std::string config_path;
   std::string replay_out;
+  std::string recover_path;
   std::size_t replay_out_events = 200'000;
   bool exit_now = false;
   int exit_code = kExitOk;
 
-  if (!parse_cli(argc, argv, cfg, config_path, replay_out, replay_out_events, exit_now,
-                 exit_code)) {
+  if (!parse_cli(argc, argv, cfg, config_path, replay_out, replay_out_events, recover_path,
+                 exit_now, exit_code)) {
     return exit_code;
   }
   if (exit_now) return exit_code;
+
+  // --recover is an inspection mode: say what the journal contains and stop.
+  // Reading a journal must never be gated on being able to start the engine.
+  if (!recover_path.empty()) {
+    const RecoveredState state = recover_from_journal(recover_path);
+    std::printf("\n=== journal recovery: %s ===\n\n%s\n", recover_path.c_str(),
+                state.summary().c_str());
+    return state.ok ? kExitOk : kExitIo;
+  }
 
   SymbolTable symbols;
   const SymbolId sym = symbols.intern(cfg.symbol);
@@ -242,6 +265,59 @@ int run(int argc, char** argv) {
   if (!config_path.empty()) std::printf("config file: %s\n", config_path.c_str());
   std::printf("\neffective configuration:\n%s\n", describe_config(cfg).c_str());
 
+  // --- recovery ------------------------------------------------------------
+  // Before anything else can trade: find out what the last session left
+  // behind. The venue still remembers our position and our resting orders even
+  // though we do not, and quoting on top of them is how a restart turns a
+  // crash into a loss.
+  Journal journal;
+  if (!cfg.journal_path.empty()) {
+    const RecoveredState recovered = recover_from_journal(cfg.journal_path);
+    if (!recovered.ok) {
+      std::fprintf(stderr, "error: %s\n", recovered.error.c_str());
+      log.stop();
+      return kExitIo;
+    }
+    if (recovered.records_read > 0) {
+      std::printf("\n--- recovered from %s ---\n%s", cfg.journal_path.c_str(),
+                  recovered.summary().c_str());
+    }
+
+    // Fail closed. An unclean shutdown or a possibly-live order is a state a
+    // human has to sign off on, so it exits with its own code rather than
+    // letting a supervisor restart straight back into it.
+    const bool needs_attention =
+        (recovered.records_read > 0 && !recovered.clean_shutdown) ||
+        !recovered.open_orders.empty() || recovered.corrupt_records > 0;
+    if (needs_attention && !cfg.allow_unclean_start) {
+      std::fprintf(stderr,
+                   "\nerror: refusing to start -- the previous session left state that needs "
+                   "reconciling:\n"
+                   "  unclean shutdown : %s\n"
+                   "  open orders      : %zu (may still be live at the venue)\n"
+                   "  corrupt records  : %llu\n"
+                   "Reconcile against the venue, then restart with "
+                   "--allow-unclean-start.\n",
+                   recovered.clean_shutdown ? "no" : "yes", recovered.open_orders.size(),
+                   (unsigned long long)recovered.corrupt_records);
+      HFT_ERROR("refusing to start after an unclean shutdown");
+      log.stop();
+      return kExitUnclean;
+    }
+
+    Journal::Config jcfg;
+    jcfg.path = cfg.journal_path;
+    jcfg.sync = cfg.journal_sync;
+    jcfg.sync_interval = cfg.journal_sync_interval;
+    jcfg.append = true;
+    if (!journal.open(jcfg)) {
+      std::fprintf(stderr, "error: %s\n", journal.error().c_str());
+      log.stop();
+      return kExitIo;
+    }
+    journal.record_session_start(now_ns());
+  }
+
   // --- feed ----------------------------------------------------------------
   std::unique_ptr<MarketDataSource> feed;
   if (!cfg.replay_path.empty()) {
@@ -269,6 +345,7 @@ int run(int argc, char** argv) {
     log.stop();
     return kExitConfig;
   }
+  if (journal.is_open()) engine->set_journal(&journal);
 
   // --- signals -------------------------------------------------------------
   // The handler only sets a flag. A watcher thread turns that flag into a
@@ -319,6 +396,18 @@ int run(int argc, char** argv) {
   HFT_INFO("engine stopped", "ticks", static_cast<double>(stats.ticks), "orders",
            static_cast<double>(stats.orders_sent), "rejects",
            static_cast<double>(stats.risk_rejects));
+
+  // Checkpoint, then mark the session closed. The checkpoint carries the PnL
+  // that cannot be rebuilt from fills alone; the end marker is what tells the
+  // next start there is nothing to reconcile.
+  if (journal.is_open()) {
+    for (const auto& kv : engine->venue().positions()) {
+      journal.record_checkpoint(kv.first, kv.second, engine->venue().realized_pnl(),
+                                engine->venue().fees_paid(), now_ns());
+    }
+    journal.record_session_end(now_ns());
+    journal.close();
+  }
 
   // --- report --------------------------------------------------------------
   const OrderBook& book = engine->book();

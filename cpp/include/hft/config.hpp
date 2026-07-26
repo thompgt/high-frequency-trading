@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "hft/engine.hpp"
+#include "hft/journal.hpp"
 #include "hft/log.hpp"
 
 namespace hft {
@@ -28,6 +29,16 @@ struct AppConfig {
   std::size_t events = 2'000'000;
   std::uint64_t seed = 0x5EEDC0DEULL;
   std::string replay_path;  // when set, replay this CSV instead of generating
+
+  // Durability. With no journal_path the engine keeps all state in memory and
+  // a crash loses it -- fine for a benchmark, not for anything operating.
+  std::string journal_path;
+  SyncPolicy journal_sync = SyncPolicy::OnWrite;
+  std::uint64_t journal_sync_interval = 256;
+  // Whether to start when the journal says the previous session did not shut
+  // down cleanly or left orders that may still be live at the venue. Default
+  // false: fail closed and make a human look.
+  bool allow_unclean_start = false;
 
   // Output
   std::string out_dir;

@@ -22,8 +22,29 @@ Engine::Engine(EngineConfig config)
   risk_.set_exposure_source(&oms_);
 }
 
+void Engine::emit(const ExecutionReport& report, EngineStats& stats) {
+  if (journal_ != nullptr && !journal_->record_exec_report(report)) {
+    ++stats.journal_failures;
+    // Losing the ability to record what happened is not a degraded mode, it is
+    // a stop condition: from here on a crash would leave state we cannot
+    // reconstruct.
+    risk_.engage_kill_switch(HaltReason::Manual);
+    request_stop();
+  }
+  oms_.apply(report);
+}
+
 Fill Engine::dispatch(const Order& order, Price reference_price, ClOrdId cl_ord_id,
                       EngineStats& stats) {
+  // Record the intent *before* the order can exist at the venue. The reverse
+  // order has a window in which we are filled on something the journal never
+  // heard of.
+  if (journal_ != nullptr && !journal_->record_order_sent(cl_ord_id, order, order.created_ts_ns)) {
+    ++stats.journal_failures;
+    risk_.engage_kill_switch(HaltReason::Manual);
+    request_stop();
+  }
+
   const Fill fill = venue_.submit(order, reference_price);
 
   // Translate the venue's synchronous answer into the report sequence a real
@@ -39,14 +60,14 @@ Fill Engine::dispatch(const Order& order, Price reference_price, ClOrdId cl_ord_
   rep.ts_ns = fill.filled_ts_ns;
 
   rep.type = ExecType::Acked;
-  oms_.apply(rep);
+  emit(rep, stats);
 
   if (fill.quantity > 0) {
     rep.type = ExecType::Fill;
     rep.price = fill.price;
     rep.quantity = fill.quantity;
     rep.fee = fill.fee;
-    oms_.apply(rep);
+    emit(rep, stats);
   }
 
   // A marketable order does not rest, so any remainder is dead as soon as the
@@ -59,7 +80,7 @@ Fill Engine::dispatch(const Order& order, Price reference_price, ClOrdId cl_ord_
     rep.type = ExecType::Cancelled;
     rep.quantity = 0;
     rep.fee = 0.0;
-    oms_.apply(rep);
+    emit(rep, stats);
   }
   return fill;
 }
@@ -163,9 +184,19 @@ void Engine::process(const Tick& tick, EngineStats& stats) {
   ++stats.orders_sent;
 
   // --- stage 6: post-trade risk --------------------------------------------
+  const bool was_halted = risk_.halted();
   risk_.on_fill(fill);
   risk_.on_equity(venue_.equity(order.symbol, reference));
-  if (risk_.halted()) stats.halted = true;
+  if (risk_.halted()) {
+    stats.halted = true;
+    // Why we stopped is the first question anyone asks afterwards, so the
+    // transition is journalled (and fsynced) rather than merely counted.
+    if (!was_halted && journal_ != nullptr) {
+      if (!journal_->record_halt(static_cast<std::uint8_t>(risk_.halt_reason()), ord_end)) {
+        ++stats.journal_failures;
+      }
+    }
+  }
 }
 
 std::uint64_t Engine::flatten(EngineStats& stats) {

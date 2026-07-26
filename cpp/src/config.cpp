@@ -74,6 +74,8 @@ const std::vector<std::string>& config_keys() {
       "max_orders_per_second", "max_daily_orders", "max_drawdown",
       // order management
       "max_open_orders", "ack_timeout_ms", "order_history",
+      // durability
+      "journal_path", "journal_sync", "journal_sync_interval", "allow_unclean_start",
       // output / ops
       "out_dir", "depth_levels", "log_level", "flatten_on_exit",
   };
@@ -231,6 +233,25 @@ bool apply_config_setting(const std::string& key, const std::string& value, AppC
     if (!need_i64("order_history") || !need_positive("order_history", i)) return false;
     cfg.engine.oms.retired_history = static_cast<std::size_t>(i);
 
+    // --- durability ---------------------------------------------------------
+  } else if (key == "journal_path") {
+    cfg.journal_path = value;
+  } else if (key == "journal_sync") {
+    SyncPolicy policy;
+    if (!parse_sync_policy(value, policy)) {
+      error = "journal_sync expects on_write/always/interval, got '" + value + "'";
+      return false;
+    }
+    cfg.journal_sync = policy;
+  } else if (key == "journal_sync_interval") {
+    if (!need_i64("journal_sync_interval") || !need_positive("journal_sync_interval", i)) {
+      return false;
+    }
+    cfg.journal_sync_interval = static_cast<std::uint64_t>(i);
+  } else if (key == "allow_unclean_start") {
+    if (!need_bool("allow_unclean_start")) return false;
+    cfg.allow_unclean_start = b;
+
     // --- output / ops -------------------------------------------------------
   } else if (key == "out_dir") {
     cfg.out_dir = value;
@@ -359,6 +380,11 @@ std::string describe_config(const AppConfig& cfg) {
      << "  max_open_orders         = " << cfg.engine.oms.max_open_orders << "\n"
      << "  ack_timeout_ms          = " << (cfg.engine.oms.ack_timeout_ns / 1'000'000) << "\n"
      << "  order_history           = " << cfg.engine.oms.retired_history << "\n"
+     << "  journal_path            = "
+     << (cfg.journal_path.empty() ? "(none -- state is lost on crash)" : cfg.journal_path) << "\n"
+     << "  journal_sync            = " << to_string(cfg.journal_sync) << "\n"
+     << "  journal_sync_interval   = " << cfg.journal_sync_interval << "\n"
+     << "  allow_unclean_start     = " << (cfg.allow_unclean_start ? "true" : "false") << "\n"
      << "  out_dir                 = " << (cfg.out_dir.empty() ? "(none)" : cfg.out_dir) << "\n"
      << "  depth_levels            = " << cfg.depth_levels << "\n"
      << "  log_level               = " << to_string(cfg.log_level) << "\n"

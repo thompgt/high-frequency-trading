@@ -445,3 +445,92 @@ TEST(journal_record_is_trivially_copyable_and_fixed_size) {
   CHECK_EQ(sizeof(JournalRecord), std::size_t(96));
   CHECK(std::is_trivially_copyable<JournalHeader>::value);
 }
+
+// ====================================================== engine integration
+
+#include "hft/engine.hpp"
+#include "hft/feed.hpp"
+
+TEST(engine_journals_every_order_and_the_result_replays_to_the_same_position) {
+  // End-to-end: run the engine with a journal attached, then rebuild state
+  // from the file alone. The recovered position has to match what the venue
+  // actually holds, or recovery is worse than useless.
+  const std::string path = scratch("journal_engine.jrn");
+  remove_file(path);
+
+  EngineConfig cfg;
+  cfg.threaded = false;
+  cfg.fast_window = 3;
+  cfg.slow_window = 8;
+  cfg.order_quantity = 5;
+  cfg.record_curve = false;
+  cfg.risk.max_orders_per_second = 1'000'000'000u;
+
+  Journal journal;
+  Journal::Config jcfg;
+  jcfg.path = path;
+  jcfg.append = false;
+  CHECK(journal.open(jcfg));
+
+  Engine engine(cfg);
+  engine.set_journal(&journal);
+
+  SyntheticFeed::Params fp;
+  fp.total_events = 60'000;
+  fp.seed = 0x1234ABCDULL;
+  SyntheticFeed feed(fp);
+
+  EngineStats stats = engine.run(feed);
+  CHECK(stats.orders_sent > 0);
+  CHECK_EQ(stats.journal_failures, std::uint64_t(0));
+  journal.record_session_end(now_ns());
+  journal.close();
+
+  const RecoveredState state = recover_from_journal(path);
+  CHECK(state.ok);
+  CHECK(state.clean_shutdown);
+  CHECK_EQ(state.corrupt_records, std::uint64_t(0));
+  CHECK_EQ(state.sequence_gaps, std::uint64_t(0));
+
+  // The position rebuilt from the journal matches the venue's own accounting.
+  CHECK_EQ(state.position(0), engine.venue().position(0));
+  // Every order the engine sent reached a terminal state, so nothing is left
+  // needing reconciliation.
+  CHECK_EQ(state.open_orders.size(), std::size_t(0));
+}
+
+TEST(engine_halts_when_the_journal_cannot_be_written) {
+  // An engine that cannot record what it did cannot be recovered, so losing
+  // the journal is a stop condition rather than a degraded mode.
+  const std::string path = scratch("journal_engine_fail.jrn");
+  remove_file(path);
+
+  EngineConfig cfg;
+  cfg.threaded = false;
+  cfg.fast_window = 3;
+  cfg.slow_window = 8;
+  cfg.record_curve = false;
+  cfg.risk.max_orders_per_second = 1'000'000'000u;
+
+  Journal journal;
+  Journal::Config jcfg;
+  jcfg.path = path;
+  jcfg.append = false;
+  CHECK(journal.open(jcfg));
+
+  Engine engine(cfg);
+  engine.set_journal(&journal);
+  // Close the file out from under the engine, standing in for a full disk or a
+  // revoked mount.
+  journal.close();
+
+  SyntheticFeed::Params fp;
+  fp.total_events = 60'000;
+  fp.seed = 0x1234ABCDULL;
+  SyntheticFeed feed(fp);
+  EngineStats stats = engine.run(feed);
+
+  CHECK(stats.journal_failures > 0);
+  CHECK(engine.risk().halted());
+  CHECK(engine.stop_requested());
+}
