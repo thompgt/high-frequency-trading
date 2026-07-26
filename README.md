@@ -1,111 +1,241 @@
 # high-frequency-trading
 
-A low-latency-oriented market data / signal / paper-trading pipeline, currently
-backed by [yfinance](https://github.com/ranaroussi/yfinance).
+A low-latency trading engine in C++17, with a Python research pipeline
+alongside it.
 
-## Important limitation: this is not actually HFT (yet)
+The engine runs entirely offline against a deterministic synthetic feed or a
+captured replay file, so `make && ./build/hft_engine` reproduces the same
+trades on any machine with a compiler. No network, no dependencies, no
+credentials.
 
-`yfinance` is an unofficial scraper of Yahoo Finance endpoints. It has no
-SLA, gets rate-limited/IP-blocked under sustained polling, and "real-time"
-fields are frequently delayed by seconds. It also has no order-execution
-API. **This is a research and paper-trading pipeline, not a low-latency
-exchange feed.**
+## What is honest about this, and what is not
 
-The architecture is deliberately built so a real feed and broker can be
-dropped in later without a rewrite:
+**Real:** the order book, the order lifecycle, the pre-trade risk controls,
+crash recovery, and the market-data session validation are built the way
+production systems build them, and the reasoning is written down in the
+headers rather than assumed. The failure paths are tested harder than the
+happy paths.
 
-- `hft/data/base.py` defines `MarketDataSource`, an async streaming
-  interface. `YFinanceSource` is one implementation; a future
-  `PolygonSource` / `FixSource` / broker WebSocket implementation is another.
-- `hft/execution/base.py` defines `ExecutionVenue`. `PaperExecutionVenue`
-  simulates fills in memory; a real broker (Alpaca, IBKR, a FIX gateway)
-  implements the same interface.
+**Not real:** there is no exchange connectivity. `PaperVenue` simulates fills
+against the live book; there is no FIX or binary order-entry session, no
+market-data snapshot channel to recover from a gap, and no colocation. The
+latency numbers below are from a general-purpose developer machine with no
+core pinning, so they measure the code, not a trading system.
 
-Nothing in `hft/core/` (the ring buffer, strategy, or engine) needs to
-change when either side is swapped.
+The Python pipeline under `hft/` is a research companion backed by
+[yfinance](https://github.com/ranaroussi/yfinance), which is an unofficial
+scraper with no SLA and no execution API. It is a paper-trading and
+prototyping tool, not a feed.
 
 ## Architecture
 
 ```
-YFinanceSource --stream()--> RingBuffer --pop()--> StrategyEngine --submit()--> ExecutionVenue
-                                                          |
-                                                          v
-                                                   LatencyRecorder
+                        ┌──────────────┐
+  feed ──sequence──────▶│ FeedMonitor  │  gap? duplicate? silent?
+   │                    └──────┬───────┘
+   │                           │  (a gap means the book is wrong -> halt)
+   ▼                           ▼
+ SPSC ring ──▶ OrderBook per instrument ──▶ Strategy ──▶ RiskManager ──▶ Venue
+                     │                                        ▲            │
+                     │                                        │            ▼
+              InstrumentRegistry                          OrderManager ◀── exec
+              (band, tick, lot)                        (state, in-flight)  reports
+                                                             │
+                                                             ▼
+                                                          Journal ──▶ recovery
 ```
 
-- **`hft/data/`** — market data source interface + yfinance polling
-  implementation. Polls `fast_info` on a background thread with jittered
-  exponential backoff to survive rate limiting.
-- **`hft/core/ringbuffer.py`** — a preallocated single-producer/
-  single-consumer ring buffer between ingestion and the strategy engine.
-  Drops the oldest tick on overflow rather than blocking the producer —
-  in a trading pipeline, stalling ingestion to preserve a stale tick is
-  the wrong tradeoff.
-- **`hft/core/strategy.py`** — example moving-average crossover strategy.
-  Swap this out for real signal logic; the engine doesn't care.
-- **`hft/core/engine.py`** — drains the ring buffer, runs the strategy,
-  forwards signals to the execution venue, and records stage-boundary
-  timestamps.
-- **`hft/execution/`** — execution venue interface + in-memory paper
-  simulator (slippage/fee modeling, position and realized-PnL tracking).
-- **`hft/metrics/timing.py`** — nanosecond ingest→signal and
-  signal→order latency tracking, with p50/p99 summaries and CSV export.
-  No network I/O on the hot path.
+Every stage is behind an interface (`MarketDataSource`, `ExecutionVenue`,
+`Strategy`, `BookProvider`), so a real feed or broker drops in without
+touching anything downstream.
+
+### The pieces
+
+| Component | File | What it is for |
+|---|---|---|
+| **Order book** | `cpp/include/hft/order_book.hpp` | Price-time priority. Flat level array + intrusive FIFO + three-tier bitmap, so best-bid/ask is O(1) and add/cancel never allocate. |
+| **Instruments** | `instrument.hpp` | Per-instrument price band, tick size, lot size, position ceiling. One book each. |
+| **Order lifecycle** | `oms.hpp` | Explicit state machine from send to terminal. Supplies in-flight exposure to risk and counts every reconciliation break. |
+| **Pre-trade risk** | `risk.hpp` | Fat-finger, price collar, inventory (including in-flight), throttle, drawdown kill switch. Fails closed. |
+| **Feed health** | `feed_health.hpp` | Sequence validation, duplicate/reorder rejection, staleness watchdog. |
+| **Durability** | `journal.hpp` | CRC32'd append-only journal; recovery rebuilds position and open orders after a crash. |
+| **Ring buffer** | `ring_buffer.hpp` | Lock-free SPSC, cache-line padded, no false sharing. |
+| **Latency** | `latency.hpp` | HdrHistogram-style buckets, allocation-free on the record path. |
+| **Logging** | `log.hpp` | Async: no formatting and no I/O on the tick path. Drops rather than blocks. |
+
+## Four things that make it operable rather than just fast
+
+These are the parts that separate an engine you can run from a benchmark.
+
+**1. In-flight orders count as risk.** Position alone is not exposure. An
+engine that has fired 500 lots and had none come back is carrying 500 lots
+that no position-based limit can see, and it will happily fire 500 more.
+Every limit is checked against position + working quantity.
+
+**2. A missed market data message stops trading.** The book is built by
+applying every message in order, so missing one leaves it not stale but
+*wrong* — permanently, because nothing later corrects it. A missed add is
+phantom liquidity; a missed cancel is depth that is not there. The correct
+response is to re-synchronise from a snapshot; this engine has no snapshot
+channel, so it does the honest half and halts.
+
+**3. A crash cannot lose what you own.** Every order is journalled before it
+can exist at the venue, and every execution report before it is applied. On
+restart, recovery runs before anything can trade. If the last session did not
+exit cleanly or left orders that may still be live, the engine **refuses to
+start** (exit code 6) until a human reconciles.
+
+**4. Divergence from the venue is counted, not swallowed.** Unknown order ids,
+duplicate acks, illegal transitions and overfills are all counted as
+reconciliation breaks. A non-zero count in `metrics.json` means our view and
+the venue's disagree.
 
 ## Running it
 
 ```bash
-pip install -r requirements.txt
-python -m hft.main --symbols AAPL MSFT --poll-interval 2
+cd cpp
+make                     # engine, tests, benchmarks
+./build/hft_engine --events 2000000 --out-dir out
 ```
 
-Useful flags: `--fast-window`, `--slow-window`, `--summary-interval`,
-`--latency-csv <path>` (dumps per-tick latency samples on shutdown).
-
-Or via Docker:
+Or with CMake:
 
 ```bash
-docker build -t hft .
-docker run --rm hft --symbols AAPL MSFT
+cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+cmake --build cpp/build --parallel
+ctest --test-dir cpp/build --output-on-failure
 ```
 
-## Demo notebook
-
-`notebooks/demo.ipynb` is an executed, end-to-end walkthrough: live tick
-ingestion via `YFinanceSource`, a synthetic crossover run through the
-`RingBuffer -> StrategyEngine -> PaperExecutionVenue` pipeline, latency
-summary stats, and a price/signal chart. Open it directly on GitHub to see
-the saved outputs, or regenerate it (pulls fresh live data and re-executes
-every cell) with:
+### Useful invocations
 
 ```bash
-pip install -r requirements-notebook.txt
-python scripts/build_demo_notebook.py
+# Trade three instruments, each with its own book, band and tick grid.
+./build/hft_engine --set instrument=AAPL:15000:30000 \
+                   --set instrument=ESZ5:400000:410000:25:1:250 \
+                   --set instrument=PENNY:100:900
+
+# Run with durability on, so a crash is recoverable.
+./build/hft_engine --journal out/engine.jrn --out-dir out
+
+# Ask a journal what the last session left behind.
+./build/hft_engine --recover out/engine.jrn
+
+# Capture a replay file, then replay it deterministically.
+./build/hft_engine --write-replay out/replay.csv --replay-events 200000
+./build/hft_engine --replay out/replay.csv
+
+# Every setting, and the effective config after files and flags are merged.
+./build/hft_engine --list-settings
+./build/hft_engine --config config/engine.conf --print-config
 ```
+
+### Docker
+
+```bash
+docker build -t hft-engine cpp/
+docker run --rm -v "$PWD/out:/app/out" -v hft-journal:/var/lib/hft hft-engine \
+  --journal /var/lib/hft/engine.jrn --out-dir /app/out
+```
+
+The image builds with `-Werror` and runs the unit tests as part of the build,
+so an image that fails its own tests never gets created. Keep the journal on a
+volume — a journal inside the container layer dies with the container, which
+defeats the point of having one.
+
+### Configuration
+
+Configuration is `key = value` in `cpp/config/engine.conf`, with CLI `--set`
+applied afterwards. **An unknown key is a hard error**, not a warning: a
+typo'd `max_postion_per_symbol` that silently leaves the real limit at its
+default is exactly the failure the config layer exists to prevent.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success |
+| 2 | Bad command line |
+| 3 | Bad configuration |
+| 4 | I/O failure (could not write artefacts, unreadable journal) |
+| 5 | Runtime fault |
+| 6 | **The previous session left state needing reconciliation.** Do not restart blindly — see [RUNBOOK.md](RUNBOOK.md). |
+
+### Artefacts
+
+`--out-dir` writes `metrics.json` (throughput, PnL, per-reason reject
+breakdown, feed health, order lifecycle, latency percentiles),
+`latency_summary.csv`, `latency_histogram.csv`, `fills.csv`, and
+`book_snapshot.csv`.
+
+## Operations
+
+[RUNBOOK.md](RUNBOOK.md) covers startup, what each halt means, how to recover
+from a crash, and which metrics to alarm on.
 
 ## Tests
 
 ```bash
+cd cpp
+make test          # 213 unit tests
+make hardened      # UBSan trap mode + _GLIBCXX_DEBUG, works on MinGW
+make asan          # ASan + UBSan (Linux; MinGW ships no sanitizer runtime)
+make tsan
+```
+
+The order book carries a randomised differential test against an
+independently-maintained shadow model — matching logic is the one place where
+a subtle bug silently corrupts everything downstream. The journal is tested
+against the states a real crash leaves behind: truncated mid-record, whole
+records lost, a flipped bit mid-file, a missing end-of-session marker.
+
+CI builds both build systems on Linux and Windows, runs ASan/UBSan/TSan, and
+asserts the operational behaviour end to end: that a gapped feed halts, that
+an unclean restart is refused with exit code 6, and that a replay reproduces
+identical trading results.
+
+## Benchmarks
+
+```bash
+cd cpp
+make bench
+```
+
+Numbers are from one developer machine with no core pinning and are not
+publishable figures — the benchmark exists to catch regressions and to find
+which stage actually dominates. Measure before optimising.
+
+## Python research pipeline
+
+```bash
 pip install -r requirements.txt
+python -m hft.main --symbols AAPL MSFT --poll-interval 2
 pytest -q
 ```
 
-All tests mock `yfinance` — none make live network calls.
+`notebooks/demo.ipynb` is an executed end-to-end walkthrough with saved
+outputs. All Python tests mock `yfinance`; none make live network calls.
 
-## Path to real low latency
+The C++ engine's paper venue mirrors `hft/execution/paper.py`'s average-cost
+accounting exactly, so both sides agree to the cent over the same fills. (One
+divergence was found while porting: `paper.py` carried the old average cost
+forward when a fill flipped a position from long to short, double-counting
+PnL that had just been realized. No Python test covered a flip. Fixed on both
+sides.)
 
-If/when this needs to be genuinely low-latency:
+## What it would take to trade real money
 
-1. Replace `YFinanceSource` with a real feed (Polygon, Databento, IEX,
-   or a broker's WebSocket/FIX market data API) behind the same
-   `MarketDataSource` interface.
-2. Replace `PaperExecutionVenue` with a real broker integration behind
-   `ExecutionVenue`.
-3. Move the ring buffer to shared memory
-   (`multiprocessing.shared_memory`) if ingestion and the engine are
-   split across processes/machines for isolation.
-4. Move hot-path numeric work (indicators, order-book math) into Numba
-   or a small Rust/C++ extension (PyO3/pybind11); pin the engine to a
-   dedicated core.
-5. Use the `LatencyRecorder` output to find the actual bottleneck before
-   optimizing — measure, don't guess.
+Honestly stated, in order:
+
+1. **Exchange connectivity.** A binary or FIX order-entry session with
+   heartbeats, cancel-on-disconnect, and sequence recovery. `ExecutionVenue`
+   is the seam; nothing above it changes.
+2. **A market data snapshot channel.** Today a gap halts the engine because
+   there is no way to rebuild the book. With snapshot recovery it could
+   re-synchronise and carry on.
+3. **Venue-side reconciliation on startup.** Recovery currently reports what
+   *we* think is open. It should then ask the venue and compare.
+4. **A real strategy.** The moving-average crossover is a placeholder that
+   exists to exercise the pipeline.
+5. **Hardware and tuning.** Core pinning, isolated CPUs, huge pages, kernel
+   bypass. Only after the `LatencyRecorder` output says where the time
+   actually goes.

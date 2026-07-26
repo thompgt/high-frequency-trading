@@ -71,6 +71,82 @@ jobs:
           ! ./build/hft_engine --set fast_window=50 --set slow_window=10 --events 1000
           ./build/hft_engine --config config/engine.conf --print-config
 
+      - name: Multiple instruments each get their own book
+        working-directory: cpp
+        run: |
+          mkdir -p out
+          ./build/hft_engine --events 90000 --out-dir out \
+            --set instrument=AAPL:15000:30000 \
+            --set instrument=ESZ5:400000:410000:25:1:250 \
+            --set instrument=PENNY:100:900 \
+            --set max_orders_per_second=100000000 > out/multi.txt
+          # Three separate books, each reported separately.
+          grep -q "final book: AAPL"  out/multi.txt
+          grep -q "final book: ESZ5"  out/multi.txt
+          grep -q "final book: PENNY" out/multi.txt
+          # The snapshot has to name which book each level belongs to.
+          grep -q "^symbol,side,price" out/book_snapshot.csv
+          grep -q "^ESZ5,"            out/book_snapshot.csv
+          # A tick-grid instrument must still build real depth -- if the feed
+          # ignored tick_size the contract check would reject nearly all of it.
+          test "$(grep -c '^ESZ5,' out/book_snapshot.csv)" -gt 5
+
+      - name: Journal survives a crash and blocks an unclean restart
+        working-directory: cpp
+        run: |
+          mkdir -p out
+          rm -f out/ci.jrn
+          ./build/hft_engine --events 60000 --journal out/ci.jrn \
+            --set max_orders_per_second=100000000 > /dev/null
+          # A clean shutdown must restart without complaint.
+          ./build/hft_engine --events 1000 --journal out/ci.jrn \
+            --set max_orders_per_second=100000000 > /dev/null
+
+          # Now simulate a crash: truncate mid-record, losing the end marker.
+          python3 -c "import os; p='out/ci.jrn'; os.truncate(p, os.path.getsize(p)-232)"
+
+          # Exit code 6 means "the last session left state a human must look
+          # at". A supervisor restarting blindly must NOT get away with it.
+          set +e
+          ./build/hft_engine --events 1000 --journal out/ci.jrn > out/unclean.txt 2>&1
+          code=$?
+          set -e
+          test "$code" -eq 6
+          grep -q "refusing to start" out/unclean.txt
+
+          # --recover explains what is there without needing to start.
+          ./build/hft_engine --recover out/ci.jrn | tee out/recover.txt
+          grep -q "torn tail" out/recover.txt
+          # And the explicit override lets an operator proceed.
+          ./build/hft_engine --events 1000 --journal out/ci.jrn \
+            --allow-unclean-start --set max_orders_per_second=100000000 > /dev/null
+
+      - name: A gapped feed must stop trading
+        working-directory: cpp
+        run: |
+          mkdir -p out
+          ./build/hft_engine --write-replay out/gapped.csv --replay-events 40000
+          # Delete a block of rows from the middle of the capture, leaving the
+          # sequence numbers discontinuous.
+          python3 - <<'EOF'
+          rows = open('out/gapped.csv').read().splitlines()
+          head, body = rows[0], rows[1:]
+          body = body[:15000] + body[15500:]
+          open('out/gapped.csv', 'w').write('\n'.join([head] + body) + '\n')
+          EOF
+          ./build/hft_engine --replay out/gapped.csv --out-dir out \
+            --set max_orders_per_second=100000000 > out/gap.txt 2>&1
+          grep -q "sequence gaps       : 1" out/gap.txt
+          # A book built from an incomplete stream must not be traded on.
+          grep -q "FAULTED" out/gap.txt
+          python3 -c "
+          import json,sys
+          m = json.load(open('out/metrics.json'))
+          assert m['feed']['faulted'] is True, m['feed']
+          assert m['feed']['messages_missing'] == 500, m['feed']
+          assert m['risk']['halted'] is True, m['risk']
+          "
+
       - name: Deterministic replay must reproduce exactly
         working-directory: cpp
         run: |
