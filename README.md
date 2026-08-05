@@ -8,6 +8,15 @@ captured replay file, so `make && ./build/hft_engine` reproduces the same
 trades on any machine with a compiler. No network, no dependencies, no
 credentials.
 
+## Tech Stack
+
+![C++](https://img.shields.io/badge/C++17-00599C?style=for-the-badge&logo=cplusplus&logoColor=white)
+![CMake](https://img.shields.io/badge/CMake-064F8C?style=for-the-badge&logo=cmake&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)
+![GitHub Actions](https://img.shields.io/badge/GitHub_Actions-2088FF?style=for-the-badge&logo=githubactions&logoColor=white)
+![yfinance](https://img.shields.io/badge/yfinance-6001D2?style=for-the-badge)
+
 ## What is honest about this, and what is not
 
 **Real:** the order book, the order lifecycle, the pre-trade risk controls,
