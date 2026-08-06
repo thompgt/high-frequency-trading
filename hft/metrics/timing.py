@@ -10,6 +10,7 @@ import logging
 import statistics
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +23,16 @@ class LatencySample:
 
 
 class LatencyRecorder:
-    def __init__(self, max_samples: int = 100_000) -> None:
+    def __init__(
+        self,
+        max_samples: int = 100_000,
+        on_sample: Callable[[LatencySample], None] | None = None,
+    ) -> None:
         self.max_samples = max_samples
+        # Optional fan-out for every recorded sample. Used to feed the
+        # Prometheus histograms (hft/metrics/prom.py) without a second copy
+        # of the stage-boundary arithmetic below.
+        self.on_sample = on_sample
         self._samples: list[LatencySample] = []
 
     def record_tick(self, tick_ingest_ns: int, signal_start_ns: int, signal_end_ns: int) -> None:
@@ -55,6 +64,8 @@ class LatencyRecorder:
         self._samples.append(sample)
         if len(self._samples) > self.max_samples:
             self._samples.pop(0)
+        if self.on_sample is not None:
+            self.on_sample(sample)
 
     def summary(self) -> dict[str, float]:
         if not self._samples:

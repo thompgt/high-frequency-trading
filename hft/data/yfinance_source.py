@@ -19,6 +19,7 @@ from typing import AsyncIterator, Sequence
 import yfinance as yf
 
 from hft.data.base import MarketDataSource, Tick
+from hft.metrics import prom
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,8 @@ class YFinanceSource(MarketDataSource):
                     if tick is not None:
                         yield tick
                 backoff = self.poll_interval_s  # reset after a clean pass
-            except Exception:
+            except Exception as exc:
+                prom.record_feed_error(exc)
                 logger.exception("yfinance poll failed, backing off %.1fs", backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, self.max_backoff_s)

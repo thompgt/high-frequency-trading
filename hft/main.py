@@ -2,6 +2,9 @@
 PaperExecutionVenue, plus periodic latency summary logging.
 
 Run with: python -m hft.main --symbols AAPL MSFT --poll-interval 2
+
+Add --metrics (or HFT_METRICS=1) to expose the Prometheus exporter on
+http://localhost:9101/metrics for the stack in monitoring/.
 """
 
 from __future__ import annotations
@@ -9,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 from pathlib import Path
 
 from hft.config import Config
@@ -18,6 +22,7 @@ from hft.core.strategy import MovingAverageCrossoverStrategy
 from hft.data.base import Tick
 from hft.data.yfinance_source import YFinanceSource
 from hft.execution.paper import PaperExecutionVenue
+from hft.metrics import prom
 from hft.metrics.timing import LatencyRecorder
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -32,6 +37,13 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument("--slow-window", type=int, default=None)
     parser.add_argument("--summary-interval", type=float, default=None)
     parser.add_argument("--latency-csv", type=str, default=None)
+    parser.add_argument(
+        "--metrics",
+        action="store_true",
+        default=None,
+        help="expose Prometheus metrics on --metrics-port (or set HFT_METRICS=1)",
+    )
+    parser.add_argument("--metrics-port", type=int, default=None)
     args = parser.parse_args(argv)
 
     cfg = Config()
@@ -47,12 +59,27 @@ def parse_args(argv: list[str] | None = None) -> Config:
         cfg.summary_interval_s = args.summary_interval
     if args.latency_csv is not None:
         cfg.latency_csv_path = args.latency_csv
+
+    # The env vars exist so the Docker image can turn the exporter on without
+    # rewriting the container's command line.
+    cfg.metrics_enabled = _env_flag("HFT_METRICS") if args.metrics is None else args.metrics
+    if args.metrics_port is not None:
+        cfg.metrics_port = args.metrics_port
+    elif os.environ.get("HFT_METRICS_PORT"):
+        cfg.metrics_port = int(os.environ["HFT_METRICS_PORT"])
     return cfg
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 async def _ingest_loop(source: YFinanceSource, symbols: list[str], buffer: RingBuffer[Tick]) -> None:
     async for tick in source.stream(symbols):
         buffer.push(tick)
+        prom.record_tick(tick.symbol, tick.price)
+        # Read after the push so an overflow drop shows up on this same tick.
+        prom.record_buffer_state(len(buffer), buffer.dropped)
 
 
 async def _summary_loop(recorder: LatencyRecorder, interval_s: float) -> None:
@@ -66,8 +93,13 @@ async def run(cfg: Config) -> None:
     source = YFinanceSource(poll_interval_s=cfg.poll_interval_s)
     strategy = MovingAverageCrossoverStrategy(fast_window=cfg.fast_window, slow_window=cfg.slow_window)
     venue = PaperExecutionVenue(slippage_bps=cfg.slippage_bps, fee_bps=cfg.fee_bps)
-    recorder = LatencyRecorder()
+    # Every recorded sample also lands in the Prometheus histograms; the
+    # recorder stays the only place stage boundaries are computed.
+    recorder = LatencyRecorder(on_sample=prom.observe_latency_sample)
     engine = StrategyEngine(buffer, strategy, venue, recorder, order_quantity=cfg.order_quantity)
+
+    if cfg.metrics_enabled:
+        prom.start_exporter(cfg.metrics_port)
 
     logger.info("starting pipeline for symbols=%s poll_interval=%.2fs", cfg.symbols, cfg.poll_interval_s)
 

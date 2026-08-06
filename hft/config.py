@@ -15,3 +15,8 @@ class Config:
     fee_bps: float = 0.5
     summary_interval_s: float = 30.0
     latency_csv_path: str | None = None
+    # Prometheus exporter. Off by default so importing/running the pipeline
+    # in tests or CI never binds a port; see monitoring/ for the stack that
+    # scrapes it.
+    metrics_enabled: bool = False
+    metrics_port: int = 9101

@@ -11,6 +11,7 @@ from hft.core.ringbuffer import RingBuffer
 from hft.core.strategy import Strategy
 from hft.data.base import Tick
 from hft.execution.base import ExecutionVenue, Order
+from hft.metrics import prom
 from hft.metrics.timing import LatencyRecorder
 
 logger = logging.getLogger(__name__)
@@ -44,10 +45,27 @@ class StrategyEngine:
                 self.recorder.record_tick(tick.ingest_ts_ns, signal_start_ns, signal_end_ns)
                 continue
 
+            prom.record_signal(signal.side)
             order = Order(symbol=signal.symbol, side=signal.side, quantity=self.order_quantity)
+            prom.record_order_submitted(order.side)
             order_start_ns = time.time_ns()
-            fill = await self.venue.submit(order, reference_price=signal.price)
+            try:
+                fill = await self.venue.submit(order, reference_price=signal.price)
+            except Exception as exc:
+                # A venue that raises is a rejected order, not a dead engine:
+                # count it (by exception type, which is a bounded label set)
+                # and keep draining the buffer. Real broker adapters will
+                # raise here far more often than the paper venue does.
+                prom.record_order_rejected(type(exc).__name__)
+                logger.exception("order rejected for %s %s", order.side, order.symbol)
+                continue
             order_end_ns = time.time_ns()
+
+            prom.record_order_filled(fill.side, fill.quantity)
+            prom.record_venue_state(
+                getattr(self.venue, "positions", {}),
+                getattr(self.venue, "realized_pnl", 0.0),
+            )
 
             self.recorder.record_signal(
                 tick_ingest_ns=tick.ingest_ts_ns,
