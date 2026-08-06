@@ -1,0 +1,16 @@
+# Provisioned at startup so Grafana comes up already pointed at Prometheus.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: hft-prometheus
+    type: prometheus
+    access: proxy
+    # Container-to-container, so the internal port 9090 -- not the host's 9091.
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # Must match prometheus.yml's scrape_interval, or Grafana's $__rate_interval
+      # computes rate() windows too small to contain two samples and panels read as empty.
+      timeInterval: 5s

@@ -1,0 +1,33 @@
+# Scrape config for the HFT Python pipeline.
+#
+# The pipeline runs on the host (python -m hft.main --metrics), not inside this
+# Compose project, so the target is host.docker.internal rather than a service
+# name. 9101 is the exporter's default port; if you start it elsewhere
+# (--metrics-port / HFT_METRICS_PORT), change it here and reload:
+#   curl -X POST http://localhost:9091/-/reload
+#
+# The C++ engine is deliberately absent: cpp/src/metrics.cpp writes a
+# end-of-run JSON report, not a live endpoint. See the README for the
+# textfile-collector follow-up that would make it scrapeable.
+
+global:
+  # 5s rather than the usual 15s: a tick-driven pipeline moves fast, and a
+  # coarse interval makes the P&L and latency panels look like step functions.
+  scrape_interval: 5s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: hft-local
+
+scrape_configs:
+  - job_name: hft-engine
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['host.docker.internal:9101']
+        labels:
+          component: python-pipeline
+
+  # Prometheus watching itself -- useful for telling "the pipeline is down"
+  # apart from "the scraper is down" when a panel goes empty.
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
