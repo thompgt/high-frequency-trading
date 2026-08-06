@@ -5,6 +5,8 @@ description = "Low-latency-oriented market data / signal / paper-trading pipelin
 requires-python = ">=3.11"
 dependencies = [
     "yfinance>=0.2.40",
+    # Live Prometheus exporter for the pipeline (see hft/metrics/prom.py).
+    "prometheus-client>=0.20",
 ]
 
 [project.optional-dependencies]
