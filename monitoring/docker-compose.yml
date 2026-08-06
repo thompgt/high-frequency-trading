@@ -12,6 +12,12 @@
 # The pipeline itself runs on the host, not in Compose -- this stack only
 # observes it.
 
+# Explicit project name. Without it Compose derives the project from the
+# directory name -- "monitoring" -- which is what every other project calls
+# this folder too, so `docker compose up` here would adopt and recreate a
+# neighbouring stack's containers and volumes.
+name: hft-monitoring
+
 services:
   prometheus:
     image: prom/prometheus:v3.1.0
