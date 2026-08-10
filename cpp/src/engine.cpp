@@ -381,8 +381,9 @@ std::uint64_t Engine::flatten(EngineStats& stats) {
 
   // Snapshot first: submitting mutates the venue's position map.
   std::vector<std::pair<SymbolId, std::int64_t>> open;
-  for (const auto& kv : venue_.positions()) {
-    if (kv.second != 0) open.emplace_back(kv.first, kv.second);
+  const std::vector<std::int64_t>& held = venue_.positions();
+  for (std::size_t sym = 0; sym < held.size(); ++sym) {
+    if (held[sym] != 0) open.emplace_back(static_cast<SymbolId>(sym), held[sym]);
   }
 
   for (const auto& kv : open) {

@@ -13,7 +13,6 @@
 
 #include <cstddef>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "hft/types.hpp"
@@ -58,10 +57,14 @@ class MovingAverageCrossover : public Strategy {
   };
 
   State& state_for(SymbolId symbol);
+  const State* state_if_present(SymbolId symbol) const;
 
   std::size_t fast_;
   std::size_t slow_;
-  std::unordered_map<SymbolId, State> states_;
+  // Indexed by SymbolId, grown on demand. SymbolId is a dense index assigned
+  // by the instrument registry, so a hash lookup on every single tick buys
+  // nothing that a bounds check and an offset does not.
+  std::vector<State> states_;
   std::uint64_t signals_ = 0;
 };
 

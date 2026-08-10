@@ -16,7 +16,6 @@
 #pragma once
 
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "hft/order_book.hpp"
@@ -86,7 +85,9 @@ class PaperVenue : public ExecutionVenue {
   double realized_pnl() const { return realized_pnl_; }
   double fees_paid() const { return fees_paid_; }
   std::int64_t position(SymbolId symbol) const;
-  const std::unordered_map<SymbolId, std::int64_t>& positions() const { return positions_; }
+  // Indexed by SymbolId. Grown as symbols are traded, so the index of an entry
+  // is its symbol and an untraded symbol beyond the end is simply flat.
+  const std::vector<std::int64_t>& positions() const { return positions_; }
   std::uint64_t fill_count() const { return fill_count_; }
 
   // Marks open positions at `price` and returns realized + unrealized PnL.
@@ -104,9 +105,14 @@ class PaperVenue : public ExecutionVenue {
   Price fill_price_for(const Order& order, Price reference_price, Quantity& filled_qty);
   void apply_pnl(SymbolId symbol, Side side, Quantity qty, double fill_px, double fee);
 
+  // Both indexed by SymbolId, which is a dense index assigned by the
+  // instrument registry -- apply_pnl() previously did three separate hash
+  // lookups per fill for keys that are array subscripts.
+  void ensure_symbol(SymbolId symbol);
+
   Config cfg_;
-  std::unordered_map<SymbolId, std::int64_t> positions_;
-  std::unordered_map<SymbolId, double> cost_basis_;  // sum of fill_px * signed_qty
+  std::vector<std::int64_t> positions_;
+  std::vector<double> cost_basis_;  // sum of fill_px * signed_qty
   double realized_pnl_ = 0.0;
   double fees_paid_ = 0.0;
   std::uint64_t fill_count_ = 0;

@@ -308,8 +308,8 @@ TEST(engine_flattens_each_instrument_against_its_own_book) {
   EngineStats stats = engine.run(feed);
 
   engine.flatten(stats);
-  for (const auto& kv : engine.venue().positions()) {
-    CHECK_EQ(kv.second, std::int64_t(0));
+  for (const std::int64_t held : engine.venue().positions()) {
+    CHECK_EQ(held, std::int64_t(0));
   }
   CHECK_EQ(engine.oms().gross_working_exposure(), std::int64_t(0));
   CHECK_EQ(engine.oms().stats().breaks(), std::uint64_t(0));

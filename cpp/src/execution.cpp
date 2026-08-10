@@ -14,8 +14,13 @@ PaperVenue::PaperVenue(Config config) : cfg_(config) {
 }
 
 std::int64_t PaperVenue::position(SymbolId symbol) const {
-  auto it = positions_.find(symbol);
-  return it == positions_.end() ? 0 : it->second;
+  return symbol < positions_.size() ? positions_[symbol] : 0;
+}
+
+void PaperVenue::ensure_symbol(SymbolId symbol) {
+  if (symbol < positions_.size()) return;
+  positions_.resize(static_cast<std::size_t>(symbol) + 1, 0);
+  cost_basis_.resize(static_cast<std::size_t>(symbol) + 1, 0.0);
 }
 
 // Determines the price this order actually gets, and how much of it fills.
@@ -53,9 +58,10 @@ Price PaperVenue::fill_price_for(const Order& order, Price reference_price, Quan
 
 // Average-cost PnL accounting, mirroring hft/execution/paper.py exactly.
 void PaperVenue::apply_pnl(SymbolId symbol, Side side, Quantity qty, double fill_px, double fee) {
+  ensure_symbol(symbol);
   const std::int64_t signed_qty = (side == Side::Buy) ? qty : -qty;
-  const std::int64_t prev_qty = position(symbol);
-  const double prev_cost = cost_basis_.count(symbol) ? cost_basis_[symbol] : 0.0;
+  const std::int64_t prev_qty = positions_[symbol];
+  const double prev_cost = cost_basis_[symbol];
 
   std::int64_t new_qty;
   if (prev_qty == 0 || ((prev_qty > 0) == (signed_qty > 0))) {
@@ -123,8 +129,7 @@ Fill PaperVenue::submit(const Order& order, Price reference_price) {
 double PaperVenue::equity(SymbolId symbol, Price mark_price) const {
   const std::int64_t qty = position(symbol);
   if (qty == 0) return realized_pnl_;
-  auto it = cost_basis_.find(symbol);
-  const double cost = it == cost_basis_.end() ? 0.0 : it->second;
+  const double cost = symbol < cost_basis_.size() ? cost_basis_[symbol] : 0.0;
   const double unrealized = price_to_double(mark_price) * static_cast<double>(qty) - cost;
   return realized_pnl_ + unrealized;
 }
