@@ -7,6 +7,21 @@
 #include "hft/latency.hpp"
 
 namespace hft {
+namespace {
+
+// Integer division that rounds up / down rather than toward zero. Prices are
+// signed, so the negative cases are spelled out rather than assumed away.
+Price ceil_div(std::int64_t num, std::int64_t den) {
+  const std::int64_t q = num / den;
+  return static_cast<Price>((num % den != 0 && (num > 0) == (den > 0)) ? q + 1 : q);
+}
+
+Price floor_div(std::int64_t num, std::int64_t den) {
+  const std::int64_t q = num / den;
+  return static_cast<Price>((num % den != 0 && (num > 0) != (den > 0)) ? q - 1 : q);
+}
+
+}  // namespace
 
 PaperVenue::PaperVenue(Config config) : cfg_(config) {
   curve_.reserve(4096);
@@ -37,7 +52,13 @@ Price PaperVenue::fill_price_for(const Order& order, Price reference_price, Quan
       std::int64_t notional = 0;
       for (const auto& t : trade_scratch_) notional += t.price * t.quantity;
       filled_qty = got;
-      return static_cast<Price>(notional / got);  // volume-weighted average
+      // Volume-weighted average, rounded *against* the aggressor. Integer
+      // division truncates toward zero, which for a buy means systematically
+      // paying up to a tick less than the sweep actually cost -- a bias in the
+      // simulator's favour, applied to every multi-level fill. Rounding away
+      // from the aggressor is the conservative direction: a backtest should
+      // not be able to profit from a rounding rule.
+      return (order.side == Side::Buy) ? ceil_div(notional, got) : floor_div(notional, got);
     }
     // The book is the authority on this instrument and it says there is
     // nothing resting on that side. Falling back to "filled in full at the

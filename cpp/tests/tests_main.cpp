@@ -785,6 +785,43 @@ TEST(venue_crossing_the_book_pays_the_volume_weighted_price) {
   CHECK_EQ(b.live_order_count(), std::size_t(0));
 }
 
+TEST(venue_rounds_the_volume_weighted_price_against_the_aggressor) {
+  // 2 @ 10000 + 1 @ 10001 = 30001 over 3, i.e. 10000.33. Integer division
+  // truncates toward zero, so the buyer used to pay 10000 -- less than the
+  // sweep cost, on every multi-level fill that did not divide exactly. A
+  // simulator has to round the way that cannot flatter the backtest.
+  {
+    OrderBook b = make_book();
+    b.add_limit(1, Side::Sell, 10000, 2);
+    b.add_limit(2, Side::Sell, 10001, 1);
+    SingleBookProvider books(&b);
+    PaperVenue v(PaperVenue::Config{0.0, 0.0, &books});
+    const Fill f = v.submit(mk_order(9, Side::Buy, 3), 10000);
+    CHECK_EQ(f.quantity, Quantity(3));
+    CHECK_EQ(f.price, Price(10001));  // rounded up: the buyer pays
+  }
+  {
+    // The mirror image: a seller receives the rounded-down price.
+    OrderBook b = make_book();
+    b.add_limit(1, Side::Buy, 10001, 2);
+    b.add_limit(2, Side::Buy, 10000, 1);
+    SingleBookProvider books(&b);
+    PaperVenue v(PaperVenue::Config{0.0, 0.0, &books});
+    const Fill f = v.submit(mk_order(9, Side::Sell, 3), 10000);
+    CHECK_EQ(f.quantity, Quantity(3));
+    CHECK_EQ(f.price, Price(10000));  // 30002/3 = 10000.67, rounded down
+  }
+  {
+    // An exact average is untouched by either rule.
+    OrderBook b = make_book();
+    b.add_limit(1, Side::Sell, 10000, 5);
+    b.add_limit(2, Side::Sell, 10100, 5);
+    SingleBookProvider books(&b);
+    PaperVenue v(PaperVenue::Config{0.0, 0.0, &books});
+    CHECK_EQ(v.submit(mk_order(9, Side::Buy, 10), 10000).price, Price(10050));
+  }
+}
+
 TEST(venue_fills_nothing_when_the_book_side_is_empty) {
   // The book is the authority on this instrument, and it says there is nothing
   // resting to buy. Filling in full at the reference price would invent
