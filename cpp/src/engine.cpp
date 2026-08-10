@@ -232,7 +232,14 @@ void Engine::process(const Tick& tick, EngineStats& stats) {
   }
 
   // --- stage 1: apply the message to the book ------------------------------
-  const Nanos book_start = now_ns();
+  // One steady_clock read per tick, to anchor the tick on the same timeline as
+  // the feed's ingest stamp and the OMS's timeouts. Every stage boundary after
+  // it is an rdtsc(), which costs a couple of cycles instead of the ~100ns a
+  // QueryPerformanceCounter read costs on Windows -- otherwise timing a 50ns
+  // book update would cost more than the update and inflate every percentile
+  // with the clock's own overhead.
+  const Nanos tick_wall_ns = now_ns();
+  const std::uint64_t tsc_tick0 = rdtsc();
   trade_scratch_.clear();
   switch (tick.type) {
     case TickType::AddOrder:
@@ -256,9 +263,11 @@ void Engine::process(const Tick& tick, EngineStats& stats) {
     case TickType::Quote:
       break;
   }
-  const Nanos book_end = now_ns();
+  const std::uint64_t tsc_book_end = rdtsc();
+  // Wall time is derived from the anchor rather than read again.
+  const Nanos book_end = tick_wall_ns + tsc_to_ns(tsc_book_end - tsc_tick0);
   stats.book_trades += trade_scratch_.size();
-  latency_.book_update.record(book_end - book_start);
+  latency_.book_update.record(tsc_to_ns(tsc_book_end - tsc_tick0));
   latency_.ingest_to_book.record(book_end - tick.ingest_ts_ns);
 
   // --- stage 1b: land any order whose venue latency has elapsed ------------
@@ -293,10 +302,10 @@ void Engine::process(const Tick& tick, EngineStats& stats) {
 
   // --- stage 3: strategy ---------------------------------------------------
   Signal signal{};
-  const Nanos sig_start = now_ns();
+  const std::uint64_t tsc_sig0 = rdtsc();
   const bool fired = strategy_.on_tick(tick, reference, signal);
-  const Nanos sig_end = now_ns();
-  latency_.signal_compute.record(sig_end - sig_start);
+  const std::uint64_t tsc_sig1 = rdtsc();
+  latency_.signal_compute.record(tsc_to_ns(tsc_sig1 - tsc_sig0));
   if (!fired) return;
   ++stats.signals;
 
@@ -320,11 +329,12 @@ void Engine::process(const Tick& tick, EngineStats& stats) {
       return;
     }
   }
-  order.created_ts_ns = sig_end;
+  order.created_ts_ns = tick_wall_ns + tsc_to_ns(tsc_sig1 - tsc_tick0);
 
-  const Nanos risk_start = now_ns();
+  const std::uint64_t tsc_risk0 = rdtsc();
+  const Nanos risk_start = tick_wall_ns + tsc_to_ns(tsc_risk0 - tsc_tick0);
   const RiskDecision decision = risk_.check(order, reference, risk_start);
-  latency_.risk_check.record(now_ns() - risk_start);
+  latency_.risk_check.record(tsc_to_ns(rdtsc() - tsc_risk0));
 
   if (!decision) {
     // Rejections are counted by reason inside RiskManager; the engine only
@@ -335,7 +345,7 @@ void Engine::process(const Tick& tick, EngineStats& stats) {
   }
 
   // --- stage 5: execution --------------------------------------------------
-  const Nanos ord_start = now_ns();
+  const Nanos ord_start = tick_wall_ns + tsc_to_ns(rdtsc() - tsc_tick0);
   const ClOrdId cl_ord_id = oms_.create(order, ord_start);
   if (cl_ord_id == 0) {
     // No room to track it. An order we cannot track is one we cannot cancel or

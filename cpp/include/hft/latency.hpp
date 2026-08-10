@@ -61,6 +61,19 @@ class TscClock {
   double ticks_per_ns_ = 0.0;
 };
 
+// Process-wide TSC calibration. Calibrating busy-waits ~20ms, so it happens
+// once, lazily, on first use rather than per engine.
+const TscClock& tsc_clock();
+
+// Converts a raw TSC delta to nanoseconds. This is the conversion that lets
+// stage boundaries be stamped with rdtsc() -- a couple of cycles -- instead of
+// steady_clock, which on Windows is QueryPerformanceCounter at roughly 100ns
+// per read. Measuring a 50ns book update with a 100ns clock costs more than
+// the thing being measured and inflates every percentile with its own
+// overhead. Where the TSC is unavailable rdtsc() already returns nanoseconds
+// and this is the identity.
+Nanos tsc_to_ns(std::uint64_t ticks);
+
 class LatencyHistogram {
  public:
   static constexpr std::size_t kSubBits = 5;
