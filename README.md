@@ -97,7 +97,7 @@ pinning, so they measure this code, not a trading system.
 **Build, test and tooling**
 - Dual build systems (CMake and plain GNU Make) kept working in parallel, static
   runtime linking for MinGW, `-Wall -Wextra -Wpedantic -Werror`.
-- 254 C++ unit tests under a ~90-line header-only harness, including a
+- 255 C++ unit tests under a ~90-line header-only harness, including a
   randomised **differential test** of the order book against an independently
   maintained shadow model, and journal tests driven by the states a real crash
   leaves behind (truncated mid-record, lost records, flipped bit, missing
@@ -197,7 +197,7 @@ cpp/                          the C++17 engine
     metrics.*       end-of-run metrics.json + CSV writers
     config.*        key=value config, unknown key is a hard error
     main.cpp        CLI, signal handling, exit codes
-  tests/            245 unit tests + header-only harness
+  tests/            255 unit tests + header-only harness
   bench/            rdtsc microbenchmarks + end-to-end pipeline latency
   config/           engine.conf, the documented reference configuration
   CMakeLists.txt · Makefile · Dockerfile
@@ -408,7 +408,7 @@ latency percentiles), `latency_summary.csv`, `latency_histogram.csv`,
 
 ```bash
 cd cpp
-make test          # 245 unit tests
+make test          # 255 unit tests
 make hardened      # UBSan trap mode + _GLIBCXX_DEBUG (works on MinGW)
 make asan          # ASan + UBSan (Linux; MinGW ships no sanitizer runtime)
 make ubsan
