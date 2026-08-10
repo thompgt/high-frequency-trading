@@ -39,7 +39,8 @@ Engine::Engine(EngineConfig config)
 
   books_.reserve(instruments_.size());
   for (const auto& instrument : instruments_.all()) {
-    books_.push_back(std::make_unique<OrderBook>(instrument.min_price, instrument.max_price));
+    books_.push_back(std::make_unique<OrderBook>(instrument.min_price, instrument.max_price,
+                                                 instrument.tick_size));
     // A per-instrument ceiling may only tighten the global one. Enforced here
     // rather than trusted from config, so a mistake cannot widen a limit.
     if (instrument.max_position > 0) {

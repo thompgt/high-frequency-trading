@@ -238,6 +238,47 @@ TEST(book_rejects_invalid_orders) {
   CHECK_EQ(b.live_order_count(), std::size_t(1));
 }
 
+TEST(book_allocates_one_level_per_tradeable_price_not_per_tick) {
+  // An ES-style band: 400000..410000 on a 25-tick grid is 401 tradeable
+  // prices, not 10001. Indexing by the raw price would leave 24 of every 25
+  // slots permanently empty and burn ~12MB doing it.
+  OrderBook es(400000, 410000, 25);
+  CHECK_EQ(es.tick_size(), Price(25));
+  CHECK_EQ(es.base_price(), Price(400000));
+  CHECK_EQ(es.level_count(), std::size_t(401));
+
+  OrderBook cents(9000, 11000);  // tick 1: unchanged
+  CHECK_EQ(cents.level_count(), std::size_t(2001));
+}
+
+TEST(book_with_a_tick_grid_matches_and_rejects_off_grid_prices) {
+  OrderBook b(400000, 410000, 25);
+  CHECK_EQ(b.add_limit(1, Side::Sell, 400050, 5), Quantity(0));
+  CHECK_EQ(b.add_limit(2, Side::Sell, 400075, 5), Quantity(0));
+  // Off the grid is not a price this instrument trades at.
+  CHECK_EQ(b.add_limit(3, Side::Sell, 400051, 5), Quantity(-1));
+  CHECK_EQ(b.best_ask(), Price(400050));
+  CHECK_EQ(b.quantity_at(Side::Sell, 400075), Quantity(5));
+
+  // Sweeping still walks the levels in price order and prices them correctly.
+  const Quantity got = b.execute_market(9, Side::Buy, 10);
+  CHECK_EQ(got, Quantity(10));
+  CHECK_EQ(b.live_order_count(), std::size_t(0));
+
+  const auto d = b.depth(Side::Sell, 5);
+  CHECK_EQ(d.size(), std::size_t(0));
+}
+
+TEST(book_grid_is_anchored_where_the_instruments_grid_is) {
+  // min_price off the grid: the lowest tradeable price is the next multiple,
+  // which is exactly what Instrument::price_is_valid says.
+  OrderBook b(400010, 400110, 25);
+  CHECK_EQ(b.base_price(), Price(400025));
+  CHECK_EQ(b.add_limit(1, Side::Buy, 400010, 5), Quantity(-1));  // off grid
+  CHECK_EQ(b.add_limit(2, Side::Buy, 400025, 5), Quantity(0));
+  CHECK_EQ(b.best_bid(), Price(400025));
+}
+
 TEST(book_modify_down_in_size_keeps_queue_priority) {
   OrderBook b = make_book();
   b.add_limit(1, Side::Buy, 10000, 100);

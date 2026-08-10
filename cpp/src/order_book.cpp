@@ -117,13 +117,37 @@ std::size_t scan_below(const std::vector<std::uint64_t>& l0, std::size_t i) {
 
 // ------------------------------------------------------------------ OrderBook
 
-OrderBook::OrderBook(Price min_price, Price max_price)
+namespace {
+
+// Lowest price on the instrument's tick grid at or above `min_price`. Anchoring
+// the book's grid to the absolute grid (rather than to min_price) keeps it
+// identical to Instrument::price_is_valid's, so a price the instrument accepts
+// is a price the book has a slot for.
+Price grid_base(Price min_price, Price tick_size) {
+  if (tick_size <= 1) return min_price;
+  const Price off = min_price % tick_size;
+  return off == 0 ? min_price : min_price + (tick_size - off);
+}
+
+// Slots per side: one per tradeable price, not one per tick of band.
+std::size_t grid_levels(Price min_price, Price max_price, Price tick_size) {
+  if (tick_size <= 0 || max_price < min_price) return 0;
+  const Price base = grid_base(min_price, tick_size);
+  if (base > max_price) return 0;
+  return static_cast<std::size_t>((max_price - base) / tick_size) + 1;
+}
+
+}  // namespace
+
+OrderBook::OrderBook(Price min_price, Price max_price, Price tick_size)
     : min_price_(min_price),
       max_price_(max_price),
-      bids_(static_cast<std::size_t>(max_price - min_price + 1)),
-      asks_(static_cast<std::size_t>(max_price - min_price + 1)),
-      bid_map_(static_cast<std::size_t>(max_price - min_price + 1)),
-      ask_map_(static_cast<std::size_t>(max_price - min_price + 1)) {
+      tick_size_(tick_size > 0 ? tick_size : 1),
+      base_(grid_base(min_price, tick_size_)),
+      bids_(grid_levels(min_price, max_price, tick_size_)),
+      asks_(grid_levels(min_price, max_price, tick_size_)),
+      bid_map_(grid_levels(min_price, max_price, tick_size_)),
+      ask_map_(grid_levels(min_price, max_price, tick_size_)) {
   if (max_price < min_price) {
     throw std::invalid_argument("OrderBook: max_price < min_price");
   }

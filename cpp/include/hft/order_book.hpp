@@ -9,10 +9,13 @@
 // O(log n) tree walk (and a cache miss per node) on every single add, cancel
 // and match. Instead this book uses the layout production venues use:
 //
-//   1. A flat array of price levels covering a fixed price band. Converting a
-//      price to a level is `price - min_price` -- one subtraction, no search,
-//      and adjacent levels are adjacent in memory so walking depth is a
-//      sequential scan the prefetcher handles for free.
+//   1. A flat array of price levels covering a fixed price band, one slot per
+//      tradeable price. Converting a price to a level is
+//      `(price - base) / tick_size` -- no search, and adjacent levels are
+//      adjacent in memory so walking depth is a sequential scan the prefetcher
+//      handles for free. Dividing by the tick matters: an instrument quoting
+//      every 25th tick would otherwise leave 24 of every 25 slots permanently
+//      empty and burn its band on prices that cannot be traded.
 //   2. Each level holds an intrusive FIFO doubly-linked list of orders, which
 //      is what gives *time* priority within a price. Orders live in a slab
 //      (`std::vector<OrderNode>`) with a free list, so add/cancel never
@@ -90,8 +93,13 @@ class OrderBook {
     std::uint32_t order_count = 0;
   };
 
-  // Inclusive price band, in ticks. Orders outside it are rejected.
-  OrderBook(Price min_price, Price max_price);
+  // Inclusive price band, in ticks, and the instrument's tick size. The flat
+  // array holds one slot per *tradeable* price, so an instrument that only
+  // quotes every 25th tick allocates a twenty-fifth of the levels rather than
+  // leaving 24 of every 25 permanently empty. A price that is not on the grid
+  // is not a price this instrument can trade at, so it is rejected exactly
+  // like one outside the band.
+  explicit OrderBook(Price min_price, Price max_price, Price tick_size = 1);
 
   // --- mutating operations -------------------------------------------------
 
@@ -143,6 +151,12 @@ class OrderBook {
   bool has_order(OrderId id) const;
   Price min_price() const { return min_price_; }
   Price max_price() const { return max_price_; }
+  Price tick_size() const { return tick_size_; }
+  // Lowest price actually tradeable: min_price rounded up onto the tick grid.
+  Price base_price() const { return base_; }
+  // Slots allocated per side. With a tick size above 1 this is far smaller
+  // than the band width, which is the whole point of storing the tick.
+  std::size_t level_count() const { return bids_.size(); }
 
  private:
   struct OrderNode {
@@ -163,12 +177,16 @@ class OrderBook {
     std::uint32_t tail = kNilNode;  // newest
   };
 
-  bool in_band(Price p) const { return p >= min_price_ && p <= max_price_; }
+  // On the band *and* on the tick grid. base_ is the lowest tradeable price,
+  // so the grid is anchored where the instrument's own grid is anchored.
+  bool in_band(Price p) const {
+    return p >= base_ && p <= max_price_ && (p - base_) % tick_size_ == 0;
+  }
   std::size_t index_of(Price p) const {
-    return static_cast<std::size_t>(p - min_price_);
+    return static_cast<std::size_t>((p - base_) / tick_size_);
   }
   Price price_at(std::size_t idx) const {
-    return min_price_ + static_cast<Price>(idx);
+    return base_ + static_cast<Price>(idx) * tick_size_;
   }
 
   std::vector<PriceLevel>& side_levels(Side s) {
@@ -200,6 +218,8 @@ class OrderBook {
 
   Price min_price_;
   Price max_price_;
+  Price tick_size_;
+  Price base_;  // min_price_ rounded up onto the tick grid
   std::vector<PriceLevel> bids_;
   std::vector<PriceLevel> asks_;
   LevelBitmap bid_map_;

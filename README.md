@@ -66,9 +66,11 @@ pinning, so they measure this code, not a trading system.
   publication, cache-line padded indices to avoid false sharing, and cached
   copies of the peer index so the common-case push/pop touches no shared state
   (`cpp/include/hft/ring_buffer.hpp`).
-- Cache-conscious limit order book: flat array of price levels (price → level is
-  one subtraction), intrusive doubly-linked FIFOs for time priority, a slab
-  allocator with a free list so add/cancel never allocate after warm-up, and a
+- Cache-conscious limit order book: flat array of price levels, one slot per
+  tradeable price (price → level is `(price - base) / tick_size`, so a coarse
+  tick grid costs proportionally less memory), intrusive doubly-linked FIFOs for
+  time priority, a slab allocator with a free list so add/cancel never allocate
+  after warm-up, and a
   three-tier hierarchical bitmap giving O(1) best-bid/ask via count-leading-zeros
   (`cpp/include/hft/order_book.hpp`).
 - Allocation-free hot paths throughout: OMS records in a slab, incremental
@@ -95,7 +97,7 @@ pinning, so they measure this code, not a trading system.
 **Build, test and tooling**
 - Dual build systems (CMake and plain GNU Make) kept working in parallel, static
   runtime linking for MinGW, `-Wall -Wextra -Wpedantic -Werror`.
-- 245 C++ unit tests under a ~90-line header-only harness, including a
+- 252 C++ unit tests under a ~90-line header-only harness, including a
   randomised **differential test** of the order book against an independently
   maintained shadow model, and journal tests driven by the states a real crash
   leaves behind (truncated mid-record, lost records, flipped bit, missing
@@ -164,7 +166,7 @@ anything downstream.
 |---|---|---|
 | **Order-flow model** (synthetic) | `cpp/src/feed.cpp` | Deterministic seeded PRNG generating a quiet-equity-book mix: ~70% passive adds near the touch, ~22% cancels of previously added orders, ~8% aggressive marketable orders, around a fair value that random-walks ±1 tick. Same seed ⇒ byte-identical stream. |
 | **Replay model** | `CsvReplayFeed` | Replays a captured CSV (`symbol,type,side,price,quantity,order_id,source_ts_ns,sequence`) so a strategy can be regression-tested against a known episode. |
-| **Book / data model** | `order_book.hpp` | Price-time priority limit order book over a fixed price band. Flat level array + intrusive FIFO per level + three-tier bitmap. |
+| **Book / data model** | `order_book.hpp` | Price-time priority limit order book over a fixed price band. Flat level array (one level per tradeable price, so a coarse tick grid costs proportionally less memory) + intrusive FIFO per level + three-tier bitmap. |
 | **Instrument model** | `instrument.hpp` | Per-instrument price band, tick size, lot size and position ceiling. Book messages violating the contract are rejected; the engine's own orders are snapped onto the tick/lot grid. A per-instrument limit may only tighten the global one. |
 | **Signal / alpha model** | `strategy.hpp`, `hft/core/strategy.py` | Moving-average crossover: a signal fires only when the fast mean crosses the slow mean (the first computed state never fires). The C++ port maintains both averages as running sums over a fixed ring, so `on_tick` is O(1) regardless of window size — the Python version's `sum()` is O(slow_window). Signals are identical, and tested to be. It is a placeholder that exercises the pipeline, not alpha. |
 | **Risk model** | `risk.hpp` | Pre-trade gate ordered cheapest-and-most-fatal-first: kill switch, order validity, fat-finger quantity, fat-finger notional, price collar (bps from reference), per-symbol inventory, gross inventory, order-rate throttle, daily order cap, peak-to-trough drawdown. Fails closed; every rejection is counted by reason. |

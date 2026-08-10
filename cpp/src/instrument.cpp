@@ -7,10 +7,11 @@
 namespace hft {
 namespace {
 
-// The book indexes its levels by (price - min_price), so the band size is a
-// hard structural limit rather than a policy one: the level bitmap is three
-// tiers of 64 bits.
-constexpr Price kMaxBandTicks = 64 * 64 * 64;
+// The book allocates one level per tradeable price -- (band / tick_size), not
+// the raw band -- so this is a limit on levels rather than on price range. It
+// is a hard structural limit rather than a policy one: the level bitmap is
+// three tiers of 64 bits.
+constexpr Price kMaxBandLevels = 64 * 64 * 64;
 
 bool parse_i64_strict(const std::string& text, long long& out) {
   if (text.empty()) return false;
@@ -47,12 +48,6 @@ bool InstrumentRegistry::add(Instrument instrument, std::string& error) {
             ".." + std::to_string(instrument.max_price);
     return false;
   }
-  if (instrument.max_price - instrument.min_price + 1 > kMaxBandTicks) {
-    error = "instrument '" + instrument.symbol + "' price band is " +
-            std::to_string(instrument.max_price - instrument.min_price + 1) +
-            " ticks, the book supports at most " + std::to_string(kMaxBandTicks);
-    return false;
-  }
   if (instrument.tick_size <= 0) {
     error = "instrument '" + instrument.symbol + "' tick_size must be positive";
     return false;
@@ -67,17 +62,24 @@ bool InstrumentRegistry::add(Instrument instrument, std::string& error) {
   }
   // A band that contains no valid price is a configuration mistake that would
   // otherwise show up as "every order is rejected" at run time.
-  if (instrument.tick_size > 1) {
-    const Price first =
-        instrument.min_price % instrument.tick_size == 0
-            ? instrument.min_price
-            : instrument.min_price + (instrument.tick_size - instrument.min_price %
-                                                                 instrument.tick_size);
-    if (first > instrument.max_price) {
-      error = "instrument '" + instrument.symbol + "' has no price on a " +
-              std::to_string(instrument.tick_size) + "-tick grid within its band";
-      return false;
-    }
+  const Price first =
+      instrument.tick_size <= 1 || instrument.min_price % instrument.tick_size == 0
+          ? instrument.min_price
+          : instrument.min_price +
+                (instrument.tick_size - instrument.min_price % instrument.tick_size);
+  if (first > instrument.max_price) {
+    error = "instrument '" + instrument.symbol + "' has no price on a " +
+            std::to_string(instrument.tick_size) + "-tick grid within its band";
+    return false;
+  }
+  // Levels, not ticks: the book allocates one slot per tradeable price, so a
+  // wide band on a coarse tick grid is perfectly affordable.
+  const Price levels = (instrument.max_price - first) / instrument.tick_size + 1;
+  if (levels > kMaxBandLevels) {
+    error = "instrument '" + instrument.symbol + "' price band is " + std::to_string(levels) +
+            " levels at tick " + std::to_string(instrument.tick_size) +
+            ", the book supports at most " + std::to_string(kMaxBandLevels);
+    return false;
   }
 
   instrument.id = static_cast<SymbolId>(instruments_.size());
