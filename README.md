@@ -169,7 +169,7 @@ anything downstream.
 | **Signal / alpha model** | `strategy.hpp`, `hft/core/strategy.py` | Moving-average crossover: a signal fires only when the fast mean crosses the slow mean (the first computed state never fires). The C++ port maintains both averages as running sums over a fixed ring, so `on_tick` is O(1) regardless of window size — the Python version's `sum()` is O(slow_window). Signals are identical, and tested to be. It is a placeholder that exercises the pipeline, not alpha. |
 | **Risk model** | `risk.hpp` | Pre-trade gate ordered cheapest-and-most-fatal-first: kill switch, order validity, fat-finger quantity, fat-finger notional, price collar (bps from reference), per-symbol inventory, gross inventory, order-rate throttle, daily order cap, peak-to-trough drawdown. Fails closed; every rejection is counted by reason. |
 | **Order lifecycle model** | `oms.hpp` | Explicit state machine `PendingNew → New → PartiallyFilled → {Filled, Cancelled, Rejected, Expired}`. Supplies `working_quantity()` to the risk gate and counts every report that does not fit as a reconciliation break. |
-| **Execution / fill model** | `execution.hpp`, `hft/execution/paper.py` | `PaperVenue`. With `cross_book = true` a marketable order is matched against its own instrument's resting depth and filled at the volume-weighted price actually obtained; otherwise it falls back to `reference_price ± slippage_bps`. Fees are `fee_bps` of notional. P&L uses an average-cost basis, realized on the closing portion — accounting deliberately identical to `paper.py` so both sides agree to the cent. |
+| **Execution / fill model** | `execution.hpp`, `hft/execution/paper.py` | `PaperVenue`. With `cross_book = true` a marketable order is matched against its own instrument's resting depth and filled at the volume-weighted price actually obtained; otherwise it falls back to `reference_price ± slippage_bps`. Orders are held for `venue_latency_us` before they may touch the book, so intervening market data is applied first and an order can arrive to find the liquidity gone. Fees are `fee_bps` of notional. P&L uses an average-cost basis, realized on the closing portion — accounting deliberately identical to `paper.py` so both sides agree to the cent. |
 | **Feed-health model** | `feed_health.hpp` | Channel-level sequence validation, tolerated-gap allowance, duplicate/reorder rejection, and a staleness watchdog (`feed_stale_ms`, disabled by default because the right threshold is instrument-specific). |
 | **Latency model** | `latency.hpp`, `hft/metrics/timing.py` | Stage-boundary timestamps recorded into fixed buckets (C++) or samples with percentile summaries (Python). Allocation-free on the record path. |
 
@@ -262,9 +262,16 @@ order id and moves the order to `PendingNew`. If there is no free slot
 cannot be cancelled or reconciled. With a journal configured, the order is
 written before it can exist at the venue.
 
-**8. The venue fills it.** `PaperVenue` crosses the order against the resting
-depth in its own instrument's book and returns the volume-weighted fill price,
-or falls back to `reference_price ± slippage_bps` when no book is available. The
+**8. The venue fills it.** The order is held for `venue_latency_us` first, so
+every message that arrives while it is on the wire is applied to the book
+before it lands — an order crosses the book that exists when it *arrives*, not
+the one that produced its own signal. (Setting it to zero removes that race
+entirely, which makes any resulting P&L an upper bound rather than an
+estimate.) `PaperVenue` then crosses the order against the resting depth in its
+own instrument's book and returns the volume-weighted fill price. If that side
+of the book is empty the order fills nothing and is counted in `missed_fills`;
+the flat `reference_price ± slippage_bps` model applies only when there is no
+book at all, which is the `paper.py`-equivalent configuration. The
 execution report flows back into the OMS, which transitions the order and
 updates exposure; anything that does not fit the state machine is counted as a
 reconciliation break. Position, average cost, realized P&L, fees and the equity
@@ -369,7 +376,8 @@ is the one key that accumulates rather than overwrites.
 
 Key groups: market data (`symbol`, `events`, `seed`, `replay_path`), instruments,
 strategy (`fast_window`, `slow_window`, `order_quantity`), book (`min_price`,
-`max_price`, `ring_capacity`), venue (`slippage_bps`, `fee_bps`, `cross_book`),
+`max_price`, `ring_capacity`), venue (`slippage_bps`, `fee_bps`, `cross_book`,
+`venue_latency_us`),
 risk, order management (`max_open_orders`, `ack_timeout_ms`, `order_sweep_ms`,
 `halt_on_order_timeout`), feed health, durability (`journal_path`,
 `journal_sync`, `allow_unclean_start`, `venue_state_path`) and ops (`threaded`,

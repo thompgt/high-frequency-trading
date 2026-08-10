@@ -32,10 +32,16 @@ Price PaperVenue::fill_price_for(const Order& order, Price reference_price, Quan
       filled_qty = got;
       return static_cast<Price>(notional / got);  // volume-weighted average
     }
-    // Book was empty on that side: fall through to the reference-price model
-    // rather than silently reporting a zero fill.
+    // The book is the authority on this instrument and it says there is
+    // nothing resting on that side. Falling back to "filled in full at the
+    // reference price" would invent liquidity that demonstrably did not exist,
+    // and would do it precisely in the states where a real order would have
+    // gone unfilled -- a one-sided book. No liquidity means no fill.
+    filled_qty = 0;
+    return reference_price;
   }
 
+  // No book configured at all: the flat-bps model, exactly like paper.py.
   const double slip = static_cast<double>(reference_price) * (cfg_.slippage_bps / 10'000.0);
   const double px = (order.side == Side::Buy) ? static_cast<double>(reference_price) + slip
                                               : static_cast<double>(reference_price) - slip;

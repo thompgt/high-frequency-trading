@@ -725,6 +725,30 @@ TEST(venue_crossing_the_book_pays_the_volume_weighted_price) {
   CHECK_EQ(b.live_order_count(), std::size_t(0));
 }
 
+TEST(venue_fills_nothing_when_the_book_side_is_empty) {
+  // The book is the authority on this instrument, and it says there is nothing
+  // resting to buy. Filling in full at the reference price would invent
+  // liquidity, and would do it exactly where a real order would have missed.
+  OrderBook b = make_book();
+  b.add_limit(1, Side::Buy, 9900, 5);  // bids only
+  SingleBookProvider books(&b);
+  PaperVenue v(PaperVenue::Config{0.0, 0.0, &books});
+  const Fill f = v.submit(mk_order(9, Side::Buy, 10), 10000);
+  CHECK_EQ(f.quantity, Quantity(0));
+  CHECK_EQ(v.position(0), std::int64_t(0));
+  CHECK_NEAR(v.realized_pnl(), 0.0, 1e-9);
+  CHECK_NEAR(v.fees_paid(), 0.0, 1e-9);
+}
+
+TEST(venue_without_a_book_still_uses_the_flat_slippage_model) {
+  // The no-book configuration is the paper.py-equivalent venue, where there is
+  // no depth to consult and the reference price is all there is. It must keep
+  // filling in full.
+  PaperVenue v(PaperVenue::Config{0.0, 0.0, nullptr});
+  const Fill f = v.submit(mk_order(1, Side::Buy, 10), 10000);
+  CHECK_EQ(f.quantity, Quantity(10));
+}
+
 TEST(venue_records_an_equity_curve) {
   PaperVenue v(PaperVenue::Config{0.0, 0.0, nullptr});
   v.submit(mk_order(1, Side::Buy, 10), 10000);
@@ -1730,6 +1754,58 @@ TEST(engine_stops_mid_run_when_asked_from_another_thread) {
   const Price ba = e.book().best_ask();
   if (bb != kNoPrice && ba != kNoPrice) CHECK(bb < ba);
   CHECK_EQ(e.venue().fill_count(), st.orders_sent);
+}
+
+TEST(engine_holds_orders_for_the_configured_venue_latency) {
+  // With a latency configured, an order must not touch the book until the
+  // clock says it has arrived -- and nothing may be left in flight at the end
+  // of the run.
+  EngineConfig cfg;
+  cfg.threaded = false;
+  cfg.venue_latency_ns = 1'000'000'000;  // 1s: nothing will come due mid-run
+  cfg.risk.max_orders_per_second = 100'000'000;
+  Engine e(cfg);
+
+  SyntheticFeed::Params p;
+  p.total_events = 50000;
+  p.seed = 4242;
+  SyntheticFeed feed(p);
+  const EngineStats st = e.run(feed);
+
+  CHECK(st.signals > 0);
+  CHECK_EQ(e.pending_order_count(), std::size_t(0));  // flushed at end of run
+  CHECK_EQ(st.signals, st.orders_sent + st.risk_rejects);
+  CHECK_EQ(e.venue().fill_count(), st.orders_sent);
+}
+
+TEST(engine_venue_latency_releases_orders_only_once_they_are_due) {
+  // Drive the release clock by hand: an order held on the wire must stay held
+  // until its latency has elapsed, and must be dispatched exactly once.
+  EngineConfig cfg;
+  cfg.threaded = false;
+  cfg.venue_latency_ns = 60'000'000'000ULL;  // 60s: nothing comes due naturally
+  cfg.risk.max_orders_per_second = 100'000'000;
+  Engine e(cfg);
+  EngineStats st;
+
+  SyntheticFeed::Params p;
+  p.total_events = 20000;
+  p.seed = 7;
+  SyntheticFeed feed(p);
+  Tick tick;
+  while (feed.next(tick)) e.process(tick, st);
+
+  const std::size_t held = e.pending_order_count();
+  CHECK(held > 0);
+  CHECK_EQ(st.orders_sent, std::uint64_t(0));  // sent, but not yet arrived
+  // Not due yet: nothing may be released.
+  CHECK_EQ(e.release_pending(now_ns(), st), std::size_t(0));
+  CHECK_EQ(e.pending_order_count(), held);
+  // Forced (end-of-run) release lands every one of them, once.
+  CHECK_EQ(e.release_pending(now_ns(), st, /*force=*/true), held);
+  CHECK_EQ(e.pending_order_count(), std::size_t(0));
+  CHECK_EQ(st.orders_sent, std::uint64_t(held));
+  CHECK_EQ(e.release_pending(now_ns(), st, /*force=*/true), std::size_t(0));
 }
 
 TEST(engine_flatten_is_idempotent_and_safe_when_flat) {

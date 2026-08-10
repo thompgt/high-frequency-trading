@@ -532,6 +532,8 @@ int run(int argc, char** argv) {
   std::printf("strategy signals    : %llu\n", (unsigned long long)stats.signals);
   std::printf("orders sent         : %llu\n", (unsigned long long)stats.orders_sent);
   std::printf("risk rejects        : %llu\n", (unsigned long long)stats.risk_rejects);
+  std::printf("missed fills        : %llu  (arrived to find no liquidity)\n",
+              (unsigned long long)stats.missed_fills);
   std::printf("untracked rejects   : %llu  (no OMS slot; never sent)\n",
               (unsigned long long)stats.untracked_rejects);
   std::printf("ring buffer drops   : %llu\n", (unsigned long long)stats.dropped_ticks);

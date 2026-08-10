@@ -50,6 +50,7 @@ Engine::Engine(EngineConfig config)
   if (config.cross_book) venue_.set_books(&book_provider_);
 
   trade_scratch_.reserve(256);
+  pending_.reserve(256);
   venue_.set_record_curve(config.record_curve);
   // The pre-trade gate must see sent-but-unfilled quantity, not just filled
   // position -- otherwise a burst of in-flight orders walks past the limit.
@@ -137,6 +138,50 @@ Fill Engine::dispatch(const Order& order, Price reference_price, ClOrdId cl_ord_
   return fill;
 }
 
+void Engine::complete_order(const PendingOrder& p, EngineStats& stats) {
+  const Fill fill = dispatch(p.order, p.reference, p.cl_ord_id, stats);
+  const Nanos ord_end = now_ns();
+
+  latency_.order_round_trip.record(ord_end - p.sent_ts_ns);
+  latency_.tick_to_order.record(ord_end - p.tick_ts_ns);
+  ++stats.orders_sent;
+  if (fill.quantity == 0) ++stats.missed_fills;
+
+  // --- post-trade risk -----------------------------------------------------
+  const bool was_halted = risk_.halted();
+  risk_.on_fill(fill);
+  risk_.on_equity(venue_.equity(p.order.symbol, p.reference));
+  if (risk_.halted()) {
+    stats.halted = true;
+    // Why we stopped is the first question anyone asks afterwards, so the
+    // transition is journalled (and fsynced) rather than merely counted.
+    if (!was_halted && journal_ != nullptr) {
+      if (!journal_->record_halt(static_cast<std::uint8_t>(risk_.halt_reason()), ord_end)) {
+        ++stats.journal_failures;
+      }
+    }
+  }
+}
+
+std::size_t Engine::release_pending(Nanos now, EngineStats& stats, bool force) {
+  std::size_t released = 0;
+  while (pending_head_ < pending_.size()) {
+    // FIFO and a single latency, so the head is always the earliest release.
+    // The moment one is not due, none behind it is either.
+    if (!force && pending_[pending_head_].release_ts_ns > now) break;
+    // Copied rather than referenced: complete_order() runs the whole
+    // dispatch/OMS/risk path, which may append to pending_ and invalidate it.
+    const PendingOrder p = pending_[pending_head_++];
+    complete_order(p, stats);
+    ++released;
+  }
+  if (pending_head_ == pending_.size() && pending_head_ != 0) {
+    pending_.clear();
+    pending_head_ = 0;
+  }
+  return released;
+}
+
 void Engine::process(const Tick& tick, EngineStats& stats) {
   ++stats.ticks;
 
@@ -215,6 +260,14 @@ void Engine::process(const Tick& tick, EngineStats& stats) {
   latency_.book_update.record(book_end - book_start);
   latency_.ingest_to_book.record(book_end - tick.ingest_ts_ns);
 
+  // --- stage 1b: land any order whose venue latency has elapsed ------------
+  // Deliberately after the book update and before anything this tick decides:
+  // an order in flight has to cross the book as it stands when it arrives,
+  // including everything that happened while it was on the wire. Filling it
+  // against the book that produced its own signal is how a simulator quietly
+  // wins every race.
+  if (cfg_.venue_latency_ns > 0) release_pending(book_end, stats);
+
   // --- stage 2: derive a reference price -----------------------------------
   // The mid of the live book is a far better fair-value estimate than the last
   // trade print, which is why having a real book matters even for a strategy
@@ -290,31 +343,30 @@ void Engine::process(const Tick& tick, EngineStats& stats) {
     ++stats.untracked_rejects;
     return;
   }
-  const Fill fill = dispatch(order, signal.price, cl_ord_id, stats);
-  const Nanos ord_end = now_ns();
+  PendingOrder p{};
+  p.order = order;
+  p.reference = signal.price;
+  p.cl_ord_id = cl_ord_id;
+  p.sent_ts_ns = ord_start;
+  p.tick_ts_ns = tick.ingest_ts_ns;
+  p.release_ts_ns = ord_start + cfg_.venue_latency_ns;
 
-  latency_.order_round_trip.record(ord_end - ord_start);
-  latency_.tick_to_order.record(ord_end - tick.ingest_ts_ns);
-  ++stats.orders_sent;
-
-  // --- stage 6: post-trade risk --------------------------------------------
-  const bool was_halted = risk_.halted();
-  risk_.on_fill(fill);
-  risk_.on_equity(venue_.equity(order.symbol, reference));
-  if (risk_.halted()) {
-    stats.halted = true;
-    // Why we stopped is the first question anyone asks afterwards, so the
-    // transition is journalled (and fsynced) rather than merely counted.
-    if (!was_halted && journal_ != nullptr) {
-      if (!journal_->record_halt(static_cast<std::uint8_t>(risk_.halt_reason()), ord_end)) {
-        ++stats.journal_failures;
-      }
-    }
+  if (cfg_.venue_latency_ns <= 0) {
+    // No modelled latency: the order lands on the book that produced it.
+    complete_order(p, stats);
+    return;
   }
+  // Otherwise it waits on the wire and is dispatched by release_pending(),
+  // once every message that beat it there has been applied.
+  pending_.push_back(p);
 }
 
 std::uint64_t Engine::flatten(EngineStats& stats) {
   std::uint64_t sent = 0;
+
+  // Anything still on the wire has to land before we can know what there is to
+  // flatten -- an in-flight order is position we do not yet hold but will.
+  release_pending(now_ns(), stats, /*force=*/true);
 
   // Snapshot first: submitting mutates the venue's position map.
   std::vector<std::pair<SymbolId, std::int64_t>> open;
@@ -415,6 +467,10 @@ EngineStats Engine::run_inline(MarketDataSource& feed) {
       sweep_orders(now_ns(), stats);
     }
   }
+  // Nothing may be left on the wire: an order held back by the latency model
+  // is still an order we sent, and leaving it unanswered would understate both
+  // the fill count and the position.
+  release_pending(now_ns(), stats, /*force=*/true);
   sweep_orders(now_ns(), stats, /*force=*/true);
   stats.wall_ns = now_ns() - t0;
   return stats;
@@ -470,9 +526,13 @@ EngineStats Engine::run_threaded(MarketDataSource& feed) {
     // Idle is also where an unanswered order is most likely to be noticed: a
     // venue that has stopped responding is also a venue sending us nothing.
     sweep_orders(idle_now, stats);
+    // An idle consumer is also the one place a held order can come due
+    // without a new message to trigger it.
+    if (cfg_.venue_latency_ns > 0) release_pending(idle_now, stats);
     std::this_thread::yield();
   }
 
+  release_pending(now_ns(), stats, /*force=*/true);
   sweep_orders(now_ns(), stats, /*force=*/true);
   producer.join();
   stats.wall_ns = now_ns() - t0;
