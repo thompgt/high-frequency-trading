@@ -119,7 +119,7 @@ pinning, so they measure this code, not a trading system.
   and CSV dumps.
 - Prometheus instrumentation on a dedicated registry with deliberately bounded
   label cardinality, plus a provisioned Prometheus + Grafana stack.
-- 47 `pytest` / `pytest-asyncio` tests that mock `yfinance` entirely — no test
+- 59 `pytest` / `pytest-asyncio` tests that mock `yfinance` entirely — no test
   makes a network call — including a contract test that parses the PromQL out
   of the committed Grafana dashboard and fails if the exporter no longer
   publishes a metric or label it queries.
@@ -300,6 +300,25 @@ The Python pipeline runs the same shape at research scale and without a book:
 `StrategyEngine` drains it and runs the same crossover → `PaperExecutionVenue`
 fills at the reference price with slippage and fees, while `LatencyRecorder`
 captures stage boundaries and (optionally) feeds the Prometheus histograms.
+
+### Where the two implementations genuinely diverge
+
+They are two implementations of one design, not a port, and the honest reading
+of "the same crossover" needs these caveats:
+
+| | C++ engine | Python pipeline |
+| --- | --- | --- |
+| **Price representation** | `std::int64_t` ticks throughout (`kTickScale = 100`) | `float` dollars, because that is what yfinance reports |
+| **Fill prices** | Integer ticks | Computed in integer minor units and returned as dollars (`hft/money.py`), on the same grid and with the same round-half-away-from-zero rule — so the two venues' fills agree to the cent |
+| **Depth** | Fills cross a real order book when `cross_book` is on | No book at all; the flat `reference ± slippage_bps` model only, which is the C++ engine's no-book configuration |
+| **Moving averages** | Running sums over a fixed ring, O(1) per tick | `sum()` over the window, O(slow_window) per tick |
+| **Latency clock** | `rdtsc`, converted at report time | `perf_counter_ns()` |
+
+The price grid was the divergence that mattered, because it is the one that
+made a numeric comparison impossible; `tests/test_money.py` pins the Python
+side to the constant and the rounding rule in `cpp/include/hft/types.hpp` and
+fails if either moves. The remaining differences are structural — a pipeline
+with no book cannot produce a swept fill price no matter how it stores one.
 
 ---
 
