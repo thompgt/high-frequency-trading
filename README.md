@@ -97,7 +97,7 @@ pinning, so they measure this code, not a trading system.
 **Build, test and tooling**
 - Dual build systems (CMake and plain GNU Make) kept working in parallel, static
   runtime linking for MinGW, `-Wall -Wextra -Wpedantic -Werror`.
-- 252 C++ unit tests under a ~90-line header-only harness, including a
+- 254 C++ unit tests under a ~90-line header-only harness, including a
   randomised **differential test** of the order book against an independently
   maintained shadow model, and journal tests driven by the states a real crash
   leaves behind (truncated mid-record, lost records, flipped bit, missing
