@@ -99,6 +99,7 @@ class OrderBook {
   // leaving 24 of every 25 permanently empty. A price that is not on the grid
   // is not a price this instrument can trade at, so it is rejected exactly
   // like one outside the band.
+  // Throws std::invalid_argument for an inverted band or a non-positive tick.
   explicit OrderBook(Price min_price, Price max_price, Price tick_size = 1);
 
   // --- mutating operations -------------------------------------------------
@@ -215,6 +216,21 @@ class OrderBook {
   // linear-probe fallback would be faster still. Kept as a map for clarity --
   // it is not on the matching hot path, only on cancel/modify.
   std::uint32_t slot_for(OrderId id) const;
+
+  // The band, already checked. Nothing is allocated until one of these exists,
+  // which is the point: validating in the constructor body means validating
+  // after the member initialiser list has already sized four containers from
+  // the very numbers being validated.
+  struct ValidBand {
+    Price min_price;
+    Price max_price;
+    Price tick_size;
+    Price base;         // min_price rounded up onto the tick grid
+    std::size_t levels;  // slots per side
+  };
+  // Throws std::invalid_argument if the band is unusable.
+  static ValidBand check_band(Price min_price, Price max_price, Price tick_size);
+  explicit OrderBook(const ValidBand& band);
 
   Price min_price_;
   Price max_price_;

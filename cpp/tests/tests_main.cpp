@@ -279,6 +279,25 @@ TEST(book_grid_is_anchored_where_the_instruments_grid_is) {
   CHECK_EQ(b.best_bid(), Price(400025));
 }
 
+TEST(book_rejects_an_unusable_band_before_allocating_anything) {
+  // The band used to be validated in the constructor *body*, which runs after
+  // the member initialiser list has already sized four containers from the
+  // very numbers being checked: an inverted band underflowed to ~1.8e19 slots
+  // and the caller got bad_alloc instead of the documented invalid_argument.
+  // Config paths validate first, so only the direct API could reach this --
+  // and nothing tested it.
+  CHECK_THROWS(OrderBook(11000, 9000));
+  CHECK_THROWS(OrderBook(400000, 410000, 0));
+  CHECK_THROWS(OrderBook(400000, 410000, -25));
+  // A band whose every price is off the tick grid has no tradeable price in
+  // it at all, so it is unusable rather than merely empty.
+  CHECK_THROWS(OrderBook(400001, 400024, 25));
+
+  // A single-price band is degenerate but legal.
+  OrderBook one(400000, 400000, 25);
+  CHECK_EQ(one.level_count(), std::size_t(1));
+}
+
 TEST(book_modify_down_in_size_keeps_queue_priority) {
   OrderBook b = make_book();
   b.add_limit(1, Side::Buy, 10000, 100);
