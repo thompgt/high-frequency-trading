@@ -13,11 +13,20 @@ MovingAverageCrossover::MovingAverageCrossover(std::size_t fast_window, std::siz
 }
 
 MovingAverageCrossover::State& MovingAverageCrossover::state_for(SymbolId symbol) {
-  auto it = states_.find(symbol);
-  if (it != states_.end()) return it->second;
-  State s;
-  s.ring.assign(slow_, 0);
-  return states_.emplace(symbol, std::move(s)).first->second;
+  const std::size_t idx = static_cast<std::size_t>(symbol);
+  if (idx >= states_.size()) states_.resize(idx + 1);
+  State& s = states_[idx];
+  // An empty ring is the "never seen this symbol" marker: slow_ is always at
+  // least 2, so a live state can never have one.
+  if (s.ring.empty()) s.ring.assign(slow_, 0);
+  return s;
+}
+
+const MovingAverageCrossover::State* MovingAverageCrossover::state_if_present(
+    SymbolId symbol) const {
+  const std::size_t idx = static_cast<std::size_t>(symbol);
+  if (idx >= states_.size() || states_[idx].ring.empty()) return nullptr;
+  return &states_[idx];
 }
 
 bool MovingAverageCrossover::on_tick(const Tick& tick, Price reference_price, Signal& out) {
@@ -71,10 +80,10 @@ void MovingAverageCrossover::reset() {
 }
 
 bool MovingAverageCrossover::averages(SymbolId symbol, double& fast_avg, double& slow_avg) const {
-  auto it = states_.find(symbol);
-  if (it == states_.end() || it->second.filled < slow_) return false;
-  fast_avg = static_cast<double>(it->second.fast_sum) / static_cast<double>(fast_);
-  slow_avg = static_cast<double>(it->second.slow_sum) / static_cast<double>(slow_);
+  const State* s = state_if_present(symbol);
+  if (s == nullptr || s->filled < slow_) return false;
+  fast_avg = static_cast<double>(s->fast_sum) / static_cast<double>(fast_);
+  slow_avg = static_cast<double>(s->slow_sum) / static_cast<double>(slow_);
   return true;
 }
 

@@ -47,6 +47,21 @@ struct EngineConfig {
   bool threaded = true;
   // Cross real book liquidity on execution instead of the flat-bps model.
   bool cross_book = true;
+
+  // Simulated one-way wire + venue latency. An order is held for this long
+  // before it is allowed to touch the book, so every message that arrives in
+  // the meantime is applied first and the order crosses the book that exists
+  // when it lands -- not the one that produced the signal.
+  //
+  // Zero means the order crosses the very book state the signalling tick
+  // produced, with no chance of being beaten to the liquidity. That is the
+  // fastest configuration to reason about and the one every unit test uses,
+  // but it is also strictly optimistic: a PnL measured at zero latency is an
+  // upper bound, not an estimate. Anything claiming to be a backtest result
+  // should set this (config key `venue_latency_us`) to a latency the strategy
+  // could actually achieve; config/engine.conf ships a non-zero default for
+  // exactly that reason.
+  Nanos venue_latency_ns = 0;
   bool record_curve = true;
   // Pre-trade risk limits. Every order goes through these before the venue.
   RiskLimits risk;
@@ -108,6 +123,11 @@ struct EngineStats {
   // Orders that went unanswered past the ack timeout. Every one of them is an
   // order whose state at the venue we do not know.
   std::uint64_t timed_out_orders = 0;
+  // Orders that reached the book after the configured venue latency and found
+  // nothing left to trade against. At zero latency this is always zero, which
+  // is the point: it is the count of races the simulator would otherwise have
+  // handed us for free.
+  std::uint64_t missed_fills = 0;
   bool halted = false;
   Nanos wall_ns = 0;
 
@@ -160,6 +180,15 @@ class Engine {
   // `force = true` to sweep regardless.
   std::size_t sweep_orders(Nanos now_ns, EngineStats& stats, bool force = false);
 
+  // Sends any order whose simulated venue latency has elapsed by `now_ns`.
+  // Called from process() once the incoming message has been applied to the
+  // book, so a held order crosses the book as it stands when it arrives.
+  // `force` releases everything regardless of the clock, which is what the end
+  // of a run does so no order is left in flight. Public for the same reason
+  // sweep_orders() is: a test needs to drive it deterministically.
+  std::size_t release_pending(Nanos now_ns, EngineStats& stats, bool force = false);
+  std::size_t pending_order_count() const { return pending_.size() - pending_head_; }
+
   // Attaches a journal. Not owned; must outlive the engine. Every order and
   // every execution report is written to it before being acted on, so a crash
   // leaves a record of what was actually in flight.
@@ -179,6 +208,19 @@ class Engine {
   bool stop_requested() const { return stop_requested_.load(std::memory_order_relaxed); }
 
  private:
+  // An order accepted by risk and the OMS but not yet allowed to reach the
+  // book, because cfg_.venue_latency_ns has not elapsed. Everything needed to
+  // dispatch it later is captured here: by the time it lands, the tick that
+  // produced it is long gone.
+  struct PendingOrder {
+    Order order;
+    Price reference = 0;
+    ClOrdId cl_ord_id = 0;
+    Nanos release_ts_ns = 0;
+    Nanos sent_ts_ns = 0;  // for the order round-trip histogram
+    Nanos tick_ts_ns = 0;  // for the end-to-end histogram
+  };
+
   EngineStats run_inline(MarketDataSource& feed);
   EngineStats run_threaded(MarketDataSource& feed);
 
@@ -186,6 +228,11 @@ class Engine {
   // reports through the OMS. Returns the fill.
   Fill dispatch(const Order& order, Price reference_price, ClOrdId cl_ord_id,
                 EngineStats& stats);
+
+  // Dispatches one order and applies everything that depends on its outcome:
+  // the round-trip histograms and the post-trade risk update. Shared by the
+  // zero-latency path (which calls it inline) and release_pending().
+  void complete_order(const PendingOrder& p, EngineStats& stats);
 
   // Applies a report to the OMS and writes it to the journal. Journalling
   // first: a report we have acted on but not recorded is invisible to
@@ -206,6 +253,12 @@ class Engine {
   // that runs every 100ms.
   std::vector<ClOrdId> expired_scratch_;
   Nanos last_sweep_ns_ = 0;
+
+  // FIFO: orders are released in the order they were sent, since they all
+  // carry the same latency. Reserved once, so holding an order never
+  // allocates on the tick path.
+  std::vector<PendingOrder> pending_;
+  std::size_t pending_head_ = 0;
 
   EngineConfig cfg_;
   InstrumentRegistry instruments_;

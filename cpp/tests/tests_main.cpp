@@ -238,6 +238,66 @@ TEST(book_rejects_invalid_orders) {
   CHECK_EQ(b.live_order_count(), std::size_t(1));
 }
 
+TEST(book_allocates_one_level_per_tradeable_price_not_per_tick) {
+  // An ES-style band: 400000..410000 on a 25-tick grid is 401 tradeable
+  // prices, not 10001. Indexing by the raw price would leave 24 of every 25
+  // slots permanently empty and burn ~12MB doing it.
+  OrderBook es(400000, 410000, 25);
+  CHECK_EQ(es.tick_size(), Price(25));
+  CHECK_EQ(es.base_price(), Price(400000));
+  CHECK_EQ(es.level_count(), std::size_t(401));
+
+  OrderBook cents(9000, 11000);  // tick 1: unchanged
+  CHECK_EQ(cents.level_count(), std::size_t(2001));
+}
+
+TEST(book_with_a_tick_grid_matches_and_rejects_off_grid_prices) {
+  OrderBook b(400000, 410000, 25);
+  CHECK_EQ(b.add_limit(1, Side::Sell, 400050, 5), Quantity(0));
+  CHECK_EQ(b.add_limit(2, Side::Sell, 400075, 5), Quantity(0));
+  // Off the grid is not a price this instrument trades at.
+  CHECK_EQ(b.add_limit(3, Side::Sell, 400051, 5), Quantity(-1));
+  CHECK_EQ(b.best_ask(), Price(400050));
+  CHECK_EQ(b.quantity_at(Side::Sell, 400075), Quantity(5));
+
+  // Sweeping still walks the levels in price order and prices them correctly.
+  const Quantity got = b.execute_market(9, Side::Buy, 10);
+  CHECK_EQ(got, Quantity(10));
+  CHECK_EQ(b.live_order_count(), std::size_t(0));
+
+  const auto d = b.depth(Side::Sell, 5);
+  CHECK_EQ(d.size(), std::size_t(0));
+}
+
+TEST(book_grid_is_anchored_where_the_instruments_grid_is) {
+  // min_price off the grid: the lowest tradeable price is the next multiple,
+  // which is exactly what Instrument::price_is_valid says.
+  OrderBook b(400010, 400110, 25);
+  CHECK_EQ(b.base_price(), Price(400025));
+  CHECK_EQ(b.add_limit(1, Side::Buy, 400010, 5), Quantity(-1));  // off grid
+  CHECK_EQ(b.add_limit(2, Side::Buy, 400025, 5), Quantity(0));
+  CHECK_EQ(b.best_bid(), Price(400025));
+}
+
+TEST(book_rejects_an_unusable_band_before_allocating_anything) {
+  // The band used to be validated in the constructor *body*, which runs after
+  // the member initialiser list has already sized four containers from the
+  // very numbers being checked: an inverted band underflowed to ~1.8e19 slots
+  // and the caller got bad_alloc instead of the documented invalid_argument.
+  // Config paths validate first, so only the direct API could reach this --
+  // and nothing tested it.
+  CHECK_THROWS(OrderBook(11000, 9000));
+  CHECK_THROWS(OrderBook(400000, 410000, 0));
+  CHECK_THROWS(OrderBook(400000, 410000, -25));
+  // A band whose every price is off the tick grid has no tradeable price in
+  // it at all, so it is unusable rather than merely empty.
+  CHECK_THROWS(OrderBook(400001, 400024, 25));
+
+  // A single-price band is degenerate but legal.
+  OrderBook one(400000, 400000, 25);
+  CHECK_EQ(one.level_count(), std::size_t(1));
+}
+
 TEST(book_modify_down_in_size_keeps_queue_priority) {
   OrderBook b = make_book();
   b.add_limit(1, Side::Buy, 10000, 100);
@@ -723,6 +783,67 @@ TEST(venue_crossing_the_book_pays_the_volume_weighted_price) {
   CHECK_EQ(f.quantity, Quantity(10));
   CHECK_EQ(f.price, Price(10050));  // (5*10000 + 5*10100) / 10
   CHECK_EQ(b.live_order_count(), std::size_t(0));
+}
+
+TEST(venue_rounds_the_volume_weighted_price_against_the_aggressor) {
+  // 2 @ 10000 + 1 @ 10001 = 30001 over 3, i.e. 10000.33. Integer division
+  // truncates toward zero, so the buyer used to pay 10000 -- less than the
+  // sweep cost, on every multi-level fill that did not divide exactly. A
+  // simulator has to round the way that cannot flatter the backtest.
+  {
+    OrderBook b = make_book();
+    b.add_limit(1, Side::Sell, 10000, 2);
+    b.add_limit(2, Side::Sell, 10001, 1);
+    SingleBookProvider books(&b);
+    PaperVenue v(PaperVenue::Config{0.0, 0.0, &books});
+    const Fill f = v.submit(mk_order(9, Side::Buy, 3), 10000);
+    CHECK_EQ(f.quantity, Quantity(3));
+    CHECK_EQ(f.price, Price(10001));  // rounded up: the buyer pays
+  }
+  {
+    // The mirror image: a seller receives the rounded-down price.
+    OrderBook b = make_book();
+    b.add_limit(1, Side::Buy, 10001, 2);
+    b.add_limit(2, Side::Buy, 10000, 1);
+    SingleBookProvider books(&b);
+    PaperVenue v(PaperVenue::Config{0.0, 0.0, &books});
+    const Fill f = v.submit(mk_order(9, Side::Sell, 3), 10000);
+    CHECK_EQ(f.quantity, Quantity(3));
+    CHECK_EQ(f.price, Price(10000));  // 30002/3 = 10000.67, rounded down
+  }
+  {
+    // An exact average is untouched by either rule.
+    OrderBook b = make_book();
+    b.add_limit(1, Side::Sell, 10000, 5);
+    b.add_limit(2, Side::Sell, 10100, 5);
+    SingleBookProvider books(&b);
+    PaperVenue v(PaperVenue::Config{0.0, 0.0, &books});
+    CHECK_EQ(v.submit(mk_order(9, Side::Buy, 10), 10000).price, Price(10050));
+  }
+}
+
+TEST(venue_fills_nothing_when_the_book_side_is_empty) {
+  // The book is the authority on this instrument, and it says there is nothing
+  // resting to buy. Filling in full at the reference price would invent
+  // liquidity, and would do it exactly where a real order would have missed.
+  OrderBook b = make_book();
+  b.add_limit(1, Side::Buy, 9900, 5);  // bids only
+  SingleBookProvider books(&b);
+  PaperVenue v(PaperVenue::Config{0.0, 0.0, &books});
+  const Fill f = v.submit(mk_order(9, Side::Buy, 10), 10000);
+  CHECK_EQ(f.quantity, Quantity(0));
+  CHECK_EQ(v.position(0), std::int64_t(0));
+  CHECK_NEAR(v.realized_pnl(), 0.0, 1e-9);
+  CHECK_NEAR(v.fees_paid(), 0.0, 1e-9);
+}
+
+TEST(venue_without_a_book_still_uses_the_flat_slippage_model) {
+  // The no-book configuration is the paper.py-equivalent venue, where there is
+  // no depth to consult and the reference price is all there is. It must keep
+  // filling in full.
+  PaperVenue v(PaperVenue::Config{0.0, 0.0, nullptr});
+  const Fill f = v.submit(mk_order(1, Side::Buy, 10), 10000);
+  CHECK_EQ(f.quantity, Quantity(10));
 }
 
 TEST(venue_records_an_equity_curve) {
@@ -1730,6 +1851,58 @@ TEST(engine_stops_mid_run_when_asked_from_another_thread) {
   const Price ba = e.book().best_ask();
   if (bb != kNoPrice && ba != kNoPrice) CHECK(bb < ba);
   CHECK_EQ(e.venue().fill_count(), st.orders_sent);
+}
+
+TEST(engine_holds_orders_for_the_configured_venue_latency) {
+  // With a latency configured, an order must not touch the book until the
+  // clock says it has arrived -- and nothing may be left in flight at the end
+  // of the run.
+  EngineConfig cfg;
+  cfg.threaded = false;
+  cfg.venue_latency_ns = 1'000'000'000;  // 1s: nothing will come due mid-run
+  cfg.risk.max_orders_per_second = 100'000'000;
+  Engine e(cfg);
+
+  SyntheticFeed::Params p;
+  p.total_events = 50000;
+  p.seed = 4242;
+  SyntheticFeed feed(p);
+  const EngineStats st = e.run(feed);
+
+  CHECK(st.signals > 0);
+  CHECK_EQ(e.pending_order_count(), std::size_t(0));  // flushed at end of run
+  CHECK_EQ(st.signals, st.orders_sent + st.risk_rejects);
+  CHECK_EQ(e.venue().fill_count(), st.orders_sent);
+}
+
+TEST(engine_venue_latency_releases_orders_only_once_they_are_due) {
+  // Drive the release clock by hand: an order held on the wire must stay held
+  // until its latency has elapsed, and must be dispatched exactly once.
+  EngineConfig cfg;
+  cfg.threaded = false;
+  cfg.venue_latency_ns = 60'000'000'000ULL;  // 60s: nothing comes due naturally
+  cfg.risk.max_orders_per_second = 100'000'000;
+  Engine e(cfg);
+  EngineStats st;
+
+  SyntheticFeed::Params p;
+  p.total_events = 20000;
+  p.seed = 7;
+  SyntheticFeed feed(p);
+  Tick tick;
+  while (feed.next(tick)) e.process(tick, st);
+
+  const std::size_t held = e.pending_order_count();
+  CHECK(held > 0);
+  CHECK_EQ(st.orders_sent, std::uint64_t(0));  // sent, but not yet arrived
+  // Not due yet: nothing may be released.
+  CHECK_EQ(e.release_pending(now_ns(), st), std::size_t(0));
+  CHECK_EQ(e.pending_order_count(), held);
+  // Forced (end-of-run) release lands every one of them, once.
+  CHECK_EQ(e.release_pending(now_ns(), st, /*force=*/true), held);
+  CHECK_EQ(e.pending_order_count(), std::size_t(0));
+  CHECK_EQ(st.orders_sent, std::uint64_t(held));
+  CHECK_EQ(e.release_pending(now_ns(), st, /*force=*/true), std::size_t(0));
 }
 
 TEST(engine_flatten_is_idempotent_and_safe_when_flat) {

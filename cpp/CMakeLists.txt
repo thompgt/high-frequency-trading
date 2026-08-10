@@ -14,6 +14,48 @@ option(HFT_STATIC_RUNTIME
 lookup at runtime and produces a single self-contained binary)"
        ON)
 option(HFT_NATIVE_ARCH "Build with -march=native (faster, not portable)" OFF)
+option(HFT_WERROR "Treat warnings as errors (the Makefile build always does)" ON)
+set(HFT_SANITIZE "" CACHE STRING
+    "Sanitizers to build with, e.g. \"address;undefined\" or \"thread\". Empty \
+disables. Needs libasan/libubsan/libtsan, which MinGW does not ship.")
+
+# Warnings belong to every translation unit in the project, not just the ones
+# in hft_core. Hanging them off an INTERFACE target that all four consumers
+# link is what makes that true: previously these were PRIVATE to hft_core, so
+# main.cpp, the seven test TUs and the bench all compiled with no -Wall at all
+# and only the Linux Makefile job ever saw a warning.
+add_library(hft_warnings INTERFACE)
+
+if(MSVC)
+  target_compile_options(hft_warnings INTERFACE /W4)
+  if(HFT_WERROR)
+    target_compile_options(hft_warnings INTERFACE /WX)
+  endif()
+else()
+  target_compile_options(hft_warnings INTERFACE -Wall -Wextra -Wpedantic)
+  if(HFT_WERROR)
+    target_compile_options(hft_warnings INTERFACE -Werror)
+  endif()
+  if(HFT_NATIVE_ARCH)
+    target_compile_options(hft_warnings INTERFACE -march=native)
+  endif()
+endif()
+
+# Sanitizers have to reach the same four targets, and have to be on the link
+# line as well as the compile line, so they live here too. Configure with e.g.
+#   cmake -S cpp -B cpp/build-asan -DHFT_SANITIZE="address;undefined" \
+#         -DHFT_STATIC_RUNTIME=OFF
+# Static runtime linking and the sanitizer runtimes do not mix, hence the
+# second flag; `make asan` in the Makefile is the equivalent for that build.
+if(HFT_SANITIZE)
+  if(MSVC)
+    message(FATAL_ERROR "HFT_SANITIZE is only wired up for GCC/Clang")
+  endif()
+  string(REPLACE ";" "," HFT_SANITIZE_LIST "${HFT_SANITIZE}")
+  target_compile_options(hft_warnings INTERFACE
+                         -fsanitize=${HFT_SANITIZE_LIST} -fno-omit-frame-pointer -g)
+  target_link_options(hft_warnings INTERFACE -fsanitize=${HFT_SANITIZE_LIST})
+endif()
 
 add_library(hft_core STATIC
   src/order_book.cpp
@@ -34,14 +76,7 @@ add_library(hft_core STATIC
 )
 target_include_directories(hft_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-if(MSVC)
-  target_compile_options(hft_core PRIVATE /W4 /O2)
-else()
-  target_compile_options(hft_core PRIVATE -Wall -Wextra -Wpedantic)
-  if(HFT_NATIVE_ARCH)
-    target_compile_options(hft_core PRIVATE -march=native)
-  endif()
-endif()
+target_link_libraries(hft_core PRIVATE hft_warnings)
 
 find_package(Threads REQUIRED)
 target_link_libraries(hft_core PUBLIC Threads::Threads)
@@ -56,7 +91,7 @@ if(HFT_STATIC_RUNTIME AND (MINGW OR CMAKE_CXX_COMPILER_ID MATCHES "GNU"))
 endif()
 
 add_executable(hft_engine src/main.cpp)
-target_link_libraries(hft_engine PRIVATE hft_core)
+target_link_libraries(hft_engine PRIVATE hft_core hft_warnings)
 
 # Tests are split by subsystem; tests_main.cpp carries the runner's main().
 add_executable(hft_tests
@@ -70,10 +105,10 @@ add_executable(hft_tests
   tests/test_order_timeout.cpp
 )
 target_include_directories(hft_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(hft_tests PRIVATE hft_core)
+target_link_libraries(hft_tests PRIVATE hft_core hft_warnings)
 
 add_executable(hft_bench bench/bench_main.cpp)
-target_link_libraries(hft_bench PRIVATE hft_core)
+target_link_libraries(hft_bench PRIVATE hft_core hft_warnings)
 
 enable_testing()
 add_test(NAME hft_unit_tests COMMAND hft_tests)

@@ -30,6 +30,21 @@ TscClock::TscClock() {
 #endif
 }
 
+const TscClock& tsc_clock() {
+  // Function-local static: calibrated on first use, thread-safe initialisation,
+  // and paid for once no matter how many engines a process builds.
+  static const TscClock clock;
+  return clock;
+}
+
+Nanos tsc_to_ns(std::uint64_t ticks) {
+  const TscClock& c = tsc_clock();
+  // Without an invariant TSC, rdtsc() is already now_ns() and the delta is
+  // already nanoseconds.
+  if (!c.usable()) return static_cast<Nanos>(ticks);
+  return c.to_ns(ticks);
+}
+
 // ----------------------------------------------------------- LatencyHistogram
 
 std::size_t LatencyHistogram::bucket_index(Nanos value) noexcept {

@@ -5,8 +5,8 @@ timestamps along the way for latency measurement."""
 from __future__ import annotations
 
 import logging
-import time
 
+from hft.clock import monotonic_ns
 from hft.core.ringbuffer import RingBuffer
 from hft.core.strategy import Strategy
 from hft.data.base import Tick
@@ -37,9 +37,9 @@ class StrategyEngine:
         self._running = True
         while self._running:
             tick = await self.buffer.pop()
-            signal_start_ns = time.time_ns()
+            signal_start_ns = monotonic_ns()
             signal = self.strategy.on_tick(tick)
-            signal_end_ns = time.time_ns()
+            signal_end_ns = monotonic_ns()
 
             if signal is None:
                 self.recorder.record_tick(tick.ingest_ts_ns, signal_start_ns, signal_end_ns)
@@ -48,7 +48,7 @@ class StrategyEngine:
             prom.record_signal(signal.side)
             order = Order(symbol=signal.symbol, side=signal.side, quantity=self.order_quantity)
             prom.record_order_submitted(order.side)
-            order_start_ns = time.time_ns()
+            order_start_ns = monotonic_ns()
             try:
                 fill = await self.venue.submit(order, reference_price=signal.price)
             except Exception as exc:
@@ -59,7 +59,7 @@ class StrategyEngine:
                 prom.record_order_rejected(type(exc).__name__)
                 logger.exception("order rejected for %s %s", order.side, order.symbol)
                 continue
-            order_end_ns = time.time_ns()
+            order_end_ns = monotonic_ns()
 
             prom.record_order_filled(fill.side, fill.quantity)
             prom.record_venue_state(

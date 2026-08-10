@@ -2,8 +2,24 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <limits>
 
 namespace hft {
+namespace {
+
+// splitmix64 finaliser. ClOrdIds are dense and consecutive, so any decent
+// avalanche keeps the linear probe chains short.
+inline std::uint64_t mix(std::uint64_t x) {
+  x += 0x9E3779B97F4A7C15ULL;
+  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+  return x ^ (x >> 31);
+}
+
+constexpr ClOrdId kEmptyKey = 0;  // id 0 is already reserved as "no order"
+constexpr ClOrdId kTombstone = std::numeric_limits<ClOrdId>::max();
+
+}  // namespace
 
 const char* to_string(OrderState s) {
   switch (s) {
@@ -54,13 +70,93 @@ OrderManager::OrderManager(Config config) : cfg_(config) {
   for (std::size_t i = capacity; i-- > 0;) {
     free_slots_.push_back(static_cast<std::uint32_t>(i));
   }
-  index_.reserve(capacity * 2);
+  index_init(capacity);
   retired_.assign(cfg_.retired_history, 0);
+  sweep_scratch_.reserve(cfg_.max_open_orders);
+}
+
+// --- id index (open addressing, linear probe, tombstone deletion) ------------
+
+void OrderManager::index_init(std::size_t capacity) {
+  // Four slots per trackable order keeps the load factor at or below 25% even
+  // with tombstones, which is what keeps probes to roughly one.
+  std::size_t size = 64;
+  while (size < capacity * 4) size <<= 1;
+  id_keys_.assign(size, kEmptyKey);
+  id_vals_.assign(size, kNilSlot);
+  id_mask_ = size - 1;
+  id_count_ = 0;
+  id_tombstones_ = 0;
 }
 
 std::uint32_t OrderManager::slot_for(ClOrdId id) const {
-  const auto it = index_.find(id);
-  return it == index_.end() ? kNilSlot : it->second;
+  if (id == kEmptyKey || id == kTombstone) return kNilSlot;
+  std::size_t i = static_cast<std::size_t>(mix(id)) & id_mask_;
+  for (;;) {
+    const ClOrdId k = id_keys_[i];
+    if (k == id) return id_vals_[i];
+    if (k == kEmptyKey) return kNilSlot;
+    i = (i + 1) & id_mask_;
+  }
+}
+
+void OrderManager::index_insert(ClOrdId id, std::uint32_t slot) {
+  if ((id_count_ + id_tombstones_ + 1) * 2 >= id_keys_.size()) index_compact();
+  std::size_t i = static_cast<std::size_t>(mix(id)) & id_mask_;
+  for (;;) {
+    const ClOrdId k = id_keys_[i];
+    if (k == kEmptyKey || k == kTombstone || k == id) {
+      if (k == kTombstone) --id_tombstones_;
+      if (k != id) ++id_count_;
+      id_keys_[i] = id;
+      id_vals_[i] = slot;
+      return;
+    }
+    i = (i + 1) & id_mask_;
+  }
+}
+
+void OrderManager::index_erase(ClOrdId id) {
+  if (id == kEmptyKey || id == kTombstone) return;
+  std::size_t i = static_cast<std::size_t>(mix(id)) & id_mask_;
+  for (;;) {
+    const ClOrdId k = id_keys_[i];
+    if (k == id) {
+      id_keys_[i] = kTombstone;
+      id_vals_[i] = kNilSlot;
+      --id_count_;
+      ++id_tombstones_;
+      return;
+    }
+    if (k == kEmptyKey) return;
+    i = (i + 1) & id_mask_;
+  }
+}
+
+void OrderManager::index_compact() {
+  // Live entries are capped by the pool, so the table never needs to grow --
+  // only to shed tombstones. Rebuilt through a swap so this is one allocation
+  // on a path that runs at most once per (table size / 2) orders, never on the
+  // steady-state send path.
+  std::vector<ClOrdId> old_keys;
+  std::vector<std::uint32_t> old_vals;
+  old_keys.swap(id_keys_);
+  old_vals.swap(id_vals_);
+
+  id_keys_.assign(old_keys.size(), kEmptyKey);
+  id_vals_.assign(old_vals.size(), kNilSlot);
+  id_count_ = 0;
+  id_tombstones_ = 0;
+
+  for (std::size_t j = 0; j < old_keys.size(); ++j) {
+    const ClOrdId k = old_keys[j];
+    if (k == kEmptyKey || k == kTombstone) continue;
+    std::size_t i = static_cast<std::size_t>(mix(k)) & id_mask_;
+    while (id_keys_[i] != kEmptyKey) i = (i + 1) & id_mask_;
+    id_keys_[i] = k;
+    id_vals_[i] = old_vals[j];
+    ++id_count_;
+  }
 }
 
 std::uint32_t OrderManager::alloc_slot() {
@@ -135,7 +231,7 @@ ClOrdId OrderManager::create_with_id(ClOrdId id, const Order& order, Nanos now_n
       ++stats_.capacity_rejects;
       return 0;
     }
-    index_.erase(evicted);
+    index_erase(evicted);
     --retired_size_;
     slot = evicted_slot;
   }
@@ -154,7 +250,7 @@ ClOrdId OrderManager::create_with_id(ClOrdId id, const Order& order, Nanos now_n
   rec.created_ts_ns = now_ns;
   rec.last_update_ts_ns = now_ns;
 
-  index_[id] = slot;
+  index_insert(id, slot);
   ++open_count_;
   add_exposure(rec.symbol, rec.side, rec.quantity);
   ++stats_.created;
@@ -220,7 +316,7 @@ void OrderManager::retire(std::uint32_t slot) {
     const ClOrdId evicted = retired_[retired_cursor_];
     const std::uint32_t evicted_slot = slot_for(evicted);
     if (evicted_slot != kNilSlot) {
-      index_.erase(evicted);
+      index_erase(evicted);
       free_slots_.push_back(evicted_slot);
     }
     --retired_size_;
@@ -369,16 +465,22 @@ bool OrderManager::request_cancel(ClOrdId id, Nanos now_ns) {
 std::size_t OrderManager::sweep_timeouts(Nanos now_ns, std::vector<ClOrdId>* out) {
   std::size_t expired = 0;
   // Walk the index rather than the pool: the working set is small and the pool
-  // is mostly retired records.
-  std::vector<ClOrdId> to_expire;
-  for (const auto& kv : index_) {
-    const OrderRecord& rec = pool_[kv.second];
+  // is mostly retired records. Expiring cannot happen inside the walk --
+  // retire() mutates the very index being walked -- so the ids are collected
+  // first, into a member reserved to the open cap rather than a fresh vector.
+  // This runs every 100ms in steady state; a vector per sweep is exactly the
+  // allocation the engine's own scratch buffer was added to avoid.
+  sweep_scratch_.clear();
+  for (std::size_t i = 0; i < id_keys_.size(); ++i) {
+    const ClOrdId key = id_keys_[i];
+    if (key == kEmptyKey || key == kTombstone) continue;
+    const OrderRecord& rec = pool_[id_vals_[i]];
     if (rec.state != OrderState::PendingNew) continue;
     if (now_ns - rec.created_ts_ns < cfg_.ack_timeout_ns) continue;
-    to_expire.push_back(rec.cl_ord_id);
+    sweep_scratch_.push_back(rec.cl_ord_id);
   }
 
-  for (const ClOrdId id : to_expire) {
+  for (const ClOrdId id : sweep_scratch_) {
     const std::uint32_t slot = slot_for(id);
     if (slot == kNilSlot) continue;
     OrderRecord& rec = pool_[slot];
@@ -400,11 +502,13 @@ const OrderRecord* OrderManager::find(ClOrdId id) const {
 std::vector<ClOrdId> OrderManager::open_orders() const {
   std::vector<ClOrdId> ids;
   ids.reserve(open_count_);
-  for (const auto& kv : index_) {
-    if (is_working(pool_[kv.second].state)) ids.push_back(kv.first);
+  for (std::size_t i = 0; i < id_keys_.size(); ++i) {
+    const ClOrdId key = id_keys_[i];
+    if (key == kEmptyKey || key == kTombstone) continue;
+    if (is_working(pool_[id_vals_[i]].state)) ids.push_back(key);
   }
-  // Deterministic order: the hash map's iteration order is not something a
-  // caller (or a test, or a log line) should depend on.
+  // Deterministic order: the table's slot order is not something a caller (or
+  // a test, or a log line) should depend on.
   std::sort(ids.begin(), ids.end());
   return ids;
 }
@@ -430,7 +534,7 @@ void OrderManager::clear() {
   for (std::size_t i = capacity; i-- > 0;) {
     free_slots_.push_back(static_cast<std::uint32_t>(i));
   }
-  index_.clear();
+  index_init(capacity);
   open_count_ = 0;
   next_id_ = 1;
   exposure_.clear();

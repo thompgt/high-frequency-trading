@@ -510,9 +510,11 @@ int run(int argc, char** argv) {
   // that cannot be rebuilt from fills alone; the end marker is what tells the
   // next start there is nothing to reconcile.
   if (journal.is_open()) {
-    for (const auto& kv : engine->venue().positions()) {
-      journal.record_checkpoint(kv.first, kv.second, engine->venue().realized_pnl(),
-                                engine->venue().fees_paid(), now_ns());
+    const std::vector<std::int64_t>& held = engine->venue().positions();
+    for (std::size_t sym = 0; sym < held.size(); ++sym) {
+      journal.record_checkpoint(static_cast<SymbolId>(sym), held[sym],
+                                engine->venue().realized_pnl(), engine->venue().fees_paid(),
+                                now_ns());
     }
     journal.record_session_end(now_ns());
     journal.close();
@@ -532,6 +534,8 @@ int run(int argc, char** argv) {
   std::printf("strategy signals    : %llu\n", (unsigned long long)stats.signals);
   std::printf("orders sent         : %llu\n", (unsigned long long)stats.orders_sent);
   std::printf("risk rejects        : %llu\n", (unsigned long long)stats.risk_rejects);
+  std::printf("missed fills        : %llu  (arrived to find no liquidity)\n",
+              (unsigned long long)stats.missed_fills);
   std::printf("untracked rejects   : %llu  (no OMS slot; never sent)\n",
               (unsigned long long)stats.untracked_rejects);
   std::printf("ring buffer drops   : %llu\n", (unsigned long long)stats.dropped_ticks);

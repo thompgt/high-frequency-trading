@@ -7,12 +7,35 @@
 #include "hft/latency.hpp"
 
 namespace hft {
+namespace {
 
-PaperVenue::PaperVenue(Config config) : cfg_(config) { curve_.reserve(4096); }
+// Integer division that rounds up / down rather than toward zero. Prices are
+// signed, so the negative cases are spelled out rather than assumed away.
+Price ceil_div(std::int64_t num, std::int64_t den) {
+  const std::int64_t q = num / den;
+  return static_cast<Price>((num % den != 0 && (num > 0) == (den > 0)) ? q + 1 : q);
+}
+
+Price floor_div(std::int64_t num, std::int64_t den) {
+  const std::int64_t q = num / den;
+  return static_cast<Price>((num % den != 0 && (num > 0) != (den > 0)) ? q - 1 : q);
+}
+
+}  // namespace
+
+PaperVenue::PaperVenue(Config config) : cfg_(config) {
+  curve_.reserve(4096);
+  trade_scratch_.reserve(64);
+}
 
 std::int64_t PaperVenue::position(SymbolId symbol) const {
-  auto it = positions_.find(symbol);
-  return it == positions_.end() ? 0 : it->second;
+  return symbol < positions_.size() ? positions_[symbol] : 0;
+}
+
+void PaperVenue::ensure_symbol(SymbolId symbol) {
+  if (symbol < positions_.size()) return;
+  positions_.resize(static_cast<std::size_t>(symbol) + 1, 0);
+  cost_basis_.resize(static_cast<std::size_t>(symbol) + 1, 0.0);
 }
 
 // Determines the price this order actually gets, and how much of it fills.
@@ -22,20 +45,31 @@ Price PaperVenue::fill_price_for(const Order& order, Price reference_price, Quan
     // Cross the real book -- this instrument's book. The order sweeps resting
     // liquidity, so the average price depends on how deep it has to reach,
     // which is what actual slippage is rather than a flat bps haircut.
-    std::vector<Trade> trades;
-    trades.reserve(8);
+    trade_scratch_.clear();
     const OrderId oid = next_venue_order_id_++;
-    const Quantity got = book->execute_market(oid, order.side, order.quantity, &trades);
+    const Quantity got = book->execute_market(oid, order.side, order.quantity, &trade_scratch_);
     if (got > 0) {
       std::int64_t notional = 0;
-      for (const auto& t : trades) notional += t.price * t.quantity;
+      for (const auto& t : trade_scratch_) notional += t.price * t.quantity;
       filled_qty = got;
-      return static_cast<Price>(notional / got);  // volume-weighted average
+      // Volume-weighted average, rounded *against* the aggressor. Integer
+      // division truncates toward zero, which for a buy means systematically
+      // paying up to a tick less than the sweep actually cost -- a bias in the
+      // simulator's favour, applied to every multi-level fill. Rounding away
+      // from the aggressor is the conservative direction: a backtest should
+      // not be able to profit from a rounding rule.
+      return (order.side == Side::Buy) ? ceil_div(notional, got) : floor_div(notional, got);
     }
-    // Book was empty on that side: fall through to the reference-price model
-    // rather than silently reporting a zero fill.
+    // The book is the authority on this instrument and it says there is
+    // nothing resting on that side. Falling back to "filled in full at the
+    // reference price" would invent liquidity that demonstrably did not exist,
+    // and would do it precisely in the states where a real order would have
+    // gone unfilled -- a one-sided book. No liquidity means no fill.
+    filled_qty = 0;
+    return reference_price;
   }
 
+  // No book configured at all: the flat-bps model, exactly like paper.py.
   const double slip = static_cast<double>(reference_price) * (cfg_.slippage_bps / 10'000.0);
   const double px = (order.side == Side::Buy) ? static_cast<double>(reference_price) + slip
                                               : static_cast<double>(reference_price) - slip;
@@ -45,9 +79,10 @@ Price PaperVenue::fill_price_for(const Order& order, Price reference_price, Quan
 
 // Average-cost PnL accounting, mirroring hft/execution/paper.py exactly.
 void PaperVenue::apply_pnl(SymbolId symbol, Side side, Quantity qty, double fill_px, double fee) {
+  ensure_symbol(symbol);
   const std::int64_t signed_qty = (side == Side::Buy) ? qty : -qty;
-  const std::int64_t prev_qty = position(symbol);
-  const double prev_cost = cost_basis_.count(symbol) ? cost_basis_[symbol] : 0.0;
+  const std::int64_t prev_qty = positions_[symbol];
+  const double prev_cost = cost_basis_[symbol];
 
   std::int64_t new_qty;
   if (prev_qty == 0 || ((prev_qty > 0) == (signed_qty > 0))) {
@@ -115,8 +150,7 @@ Fill PaperVenue::submit(const Order& order, Price reference_price) {
 double PaperVenue::equity(SymbolId symbol, Price mark_price) const {
   const std::int64_t qty = position(symbol);
   if (qty == 0) return realized_pnl_;
-  auto it = cost_basis_.find(symbol);
-  const double cost = it == cost_basis_.end() ? 0.0 : it->second;
+  const double cost = symbol < cost_basis_.size() ? cost_basis_[symbol] : 0.0;
   const double unrealized = price_to_double(mark_price) * static_cast<double>(qty) - cost;
   return realized_pnl_ + unrealized;
 }

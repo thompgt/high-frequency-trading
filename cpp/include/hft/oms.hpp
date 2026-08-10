@@ -42,7 +42,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "hft/risk.hpp"
@@ -259,9 +258,35 @@ class OrderManager : public ExposureSource {
   Config cfg_;
   std::vector<OrderRecord> pool_;
   std::vector<std::uint32_t> free_slots_;
-  std::unordered_map<ClOrdId, std::uint32_t> index_;
+  // ClOrdId -> pool slot, as a flat open-addressed table with linear probing.
+  // std::unordered_map allocated a node per order on the send path -- and
+  // reserve() only sizes buckets, so it did not prevent that. The number of
+  // tracked orders is hard-capped at max_open_orders + retired_history, so a
+  // power-of-two table sized from that ceiling never has to grow and never
+  // allocates after construction.
+  std::vector<ClOrdId> id_keys_;
+  std::vector<std::uint32_t> id_vals_;
+  std::size_t id_mask_ = 0;
+  std::size_t id_count_ = 0;       // live entries
+  std::size_t id_tombstones_ = 0;  // erased-but-still-probed slots
+  void index_init(std::size_t capacity);
+  void index_insert(ClOrdId id, std::uint32_t slot);
+  void index_erase(ClOrdId id);
+  // Rebuilds the table in place, sweeping out tombstones. Tombstones count
+  // against the probe budget just like live entries, so a manager that churns
+  // orders forever would otherwise fill the table with them and leave
+  // slot_for()'s probe with no empty slot to stop at.
+  void index_compact();
   std::size_t open_count_ = 0;
   ClOrdId next_id_ = 1;
+
+  // Scratch for sweep_timeouts(), which cannot expire orders while it is
+  // walking the index that tells it which ones to expire. Reserved to the open
+  // cap -- the most that can ever be PendingNew at once -- and cleared per
+  // sweep, so the sweep the engine runs every 100ms does not allocate. The
+  // engine keeps its own scratch for the ids it gets back; this is the one
+  // inside the walk.
+  std::vector<ClOrdId> sweep_scratch_;
 
   std::vector<Exposure> exposure_;  // indexed by SymbolId, grown on demand
   std::int64_t gross_exposure_ = 0;

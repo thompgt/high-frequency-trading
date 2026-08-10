@@ -284,6 +284,42 @@ TEST(replay_capture_round_trips_sequence_numbers) {
   CHECK_EQ(monitor.stats().gaps, std::uint64_t(0));
 }
 
+TEST(replay_reports_a_garbage_cell_instead_of_terminating) {
+  // A non-numeric cell used to reach std::stoll, which throws straight out of
+  // the constructor -- a bad input file took the process down, while a missing
+  // column next to it was politely reported. Both are now malformed rows.
+  const std::string path = "build/replay_garbage.csv";
+  {
+    std::FILE* f = std::fopen(path.c_str(), "w");
+    CHECK(f != nullptr);
+    std::fprintf(f, "symbol,type,side,price,quantity,order_id,source_ts_ns,sequence\n");
+    std::fprintf(f, "0,2,0,10000,5,1,100,1\n");
+    std::fprintf(f, "0,2,0,not_a_price,5,2,200,2\n");
+    std::fclose(f);
+  }
+
+  CsvReplayFeed replay(path);
+  CHECK_FALSE(replay.ok());
+  CHECK(replay.error().find("malformed row at line 3") != std::string::npos);
+}
+
+TEST(replay_rejects_a_cell_with_trailing_junk) {
+  // "10abc" must be an error, not 10 -- the same strictness the instrument
+  // spec parser applies.
+  const std::string path = "build/replay_trailing.csv";
+  {
+    std::FILE* f = std::fopen(path.c_str(), "w");
+    CHECK(f != nullptr);
+    std::fprintf(f, "symbol,type,side,price,quantity,order_id,source_ts_ns,sequence\n");
+    std::fprintf(f, "0,2,0,10000,5abc,1,100,1\n");
+    std::fclose(f);
+  }
+
+  CsvReplayFeed replay(path);
+  CHECK_FALSE(replay.ok());
+  CHECK(!replay.error().empty());
+}
+
 TEST(replay_tolerates_a_capture_written_before_sequence_numbers_existed) {
   // Old captures have seven columns. They must still replay -- and must read
   // as unsequenced rather than as one enormous gap.

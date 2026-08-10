@@ -65,7 +65,7 @@ const std::vector<std::string>& config_keys() {
       // strategy
       "fast_window", "slow_window", "order_quantity",
       // venue
-      "slippage_bps", "fee_bps", "cross_book",
+      "slippage_bps", "fee_bps", "cross_book", "venue_latency_us",
       // book / engine
       "min_price", "max_price", "ring_capacity", "threaded", "record_curve",
       // risk
@@ -128,6 +128,13 @@ bool apply_config_setting(const std::string& key, const std::string& value, AppC
     }
     return true;
   };
+  auto need_non_negative = [&](const char* what, long long v) {
+    if (v < 0) {
+      error = std::string(what) + " must not be negative, got " + std::to_string(v);
+      return false;
+    }
+    return true;
+  };
   auto need_non_negative_d = [&](const char* what, double v) {
     if (v < 0.0) {
       error = std::string(what) + " must not be negative, got " + value;
@@ -177,6 +184,12 @@ bool apply_config_setting(const std::string& key, const std::string& value, AppC
   } else if (key == "cross_book") {
     if (!need_bool("cross_book")) return false;
     cfg.engine.cross_book = b;
+  } else if (key == "venue_latency_us") {
+    // Microseconds in the config, nanoseconds internally. Zero is legal and
+    // means "fill against the book that produced the signal", which is
+    // optimistic by construction -- see EngineConfig::venue_latency_ns.
+    if (!need_i64("venue_latency_us") || !need_non_negative("venue_latency_us", i)) return false;
+    cfg.engine.venue_latency_ns = static_cast<Nanos>(i) * 1'000;
 
     // --- book / engine ------------------------------------------------------
   } else if (key == "min_price") {
@@ -407,6 +420,7 @@ std::string describe_config(const AppConfig& cfg) {
      << "  slippage_bps            = " << cfg.engine.slippage_bps << "\n"
      << "  fee_bps                 = " << cfg.engine.fee_bps << "\n"
      << "  cross_book              = " << (cfg.engine.cross_book ? "true" : "false") << "\n"
+     << "  venue_latency_us        = " << (cfg.engine.venue_latency_ns / 1'000) << "\n"
      << "  min_price               = " << cfg.engine.min_price << "\n"
      << "  max_price               = " << cfg.engine.max_price << "\n"
      << "  ring_capacity           = " << cfg.engine.ring_capacity << "\n"

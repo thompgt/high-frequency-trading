@@ -1,11 +1,19 @@
 """Paper-trading execution venue: fills instantly at the reference price
 (optionally with simple slippage/fee modeling) and tracks position + PnL
 in memory. This is the default venue until a real broker integration is
-wired up behind the same ExecutionVenue interface."""
+wired up behind the same ExecutionVenue interface.
+
+Fill prices are computed in integer minor units (see hft/money.py) and
+returned as dollars, the same way the C++ PaperVenue does it -- a fill price
+is a price the venue could actually quote, not an arbitrary real number, and
+keeping the two venues on one grid is what makes their results comparable.
+The P&L arithmetic below is float dollars, exactly as the C++ side's is.
+"""
 
 from __future__ import annotations
 
 from hft.execution.base import ExecutionVenue, Fill, Order
+from hft.money import from_ticks, to_ticks
 
 
 class PaperExecutionVenue(ExecutionVenue):
@@ -17,8 +25,13 @@ class PaperExecutionVenue(ExecutionVenue):
         self._cost_basis: dict[str, float] = {}
 
     async def submit(self, order: Order, reference_price: float) -> Fill:
-        slip = reference_price * (self.slippage_bps / 10_000)
-        fill_price = reference_price + slip if order.side == "BUY" else reference_price - slip
+        # Slippage is applied on the tick grid, then rounded back onto it, so
+        # the fill is a quotable price rather than a float that merely rounds
+        # to one when printed.
+        ref_ticks = to_ticks(reference_price)
+        slip_ticks = ref_ticks * (self.slippage_bps / 10_000)
+        raw = ref_ticks + slip_ticks if order.side == "BUY" else ref_ticks - slip_ticks
+        fill_price = from_ticks(int(raw + (0.5 if raw >= 0 else -0.5)))
         fee = fill_price * order.quantity * (self.fee_bps / 10_000)
 
         signed_qty = order.quantity if order.side == "BUY" else -order.quantity

@@ -377,6 +377,54 @@ TEST(oms_keeps_trading_when_history_is_full) {
   CHECK_EQ(oms.open_count(), std::size_t(0));
 }
 
+TEST(oms_id_index_survives_sustained_churn) {
+  // The id index is a flat open-addressed table, so every retired order leaves
+  // a tombstone behind. Churning far more orders than the table has slots
+  // forces repeated compaction; a compaction that dropped or misplaced a live
+  // entry would strand an order the engine can no longer cancel.
+  OrderManager::Config cfg;
+  cfg.max_open_orders = 4;
+  cfg.retired_history = 4;
+  OrderManager oms(cfg);
+
+  // One order stays PendingNew across the whole run and must survive every
+  // rebuild of the table.
+  const ClOrdId resting = oms.create(make_order(0, Side::Buy, 10000, 7), 10);
+  CHECK_NE(resting, ClOrdId(0));
+
+  ClOrdId last = 0;
+  for (int i = 0; i < 5000; ++i) {
+    const ClOrdId id = oms.create(make_order(0, Side::Buy, 10000, 1), 10);
+    CHECK_NE(id, ClOrdId(0));
+    oms.apply(ack(id));
+    oms.apply(fill(id, 10000, 1));
+    last = id;
+
+    // The long-lived order is still reachable, and still itself.
+    const OrderRecord* held = oms.find(resting);
+    CHECK(held != nullptr);
+    CHECK_EQ(held->quantity, Quantity(7));
+  }
+
+  CHECK_EQ(oms.stats().capacity_rejects, std::uint64_t(0));
+  CHECK_EQ(oms.stats().filled_orders, std::uint64_t(5000));
+
+  // The newest orders are still in the history window...
+  CHECK(oms.find(last) != nullptr);
+  CHECK_EQ(int(oms.find(last)->state), int(OrderState::Filled));
+  // ...the oldest have aged out and left no trace behind them...
+  CHECK(oms.find(last - 100) == nullptr);
+  // ...and an id that was never issued is still unknown.
+  CHECK(oms.find(last + 1000) == nullptr);
+
+  // The resting order is the only thing still working, and its exposure is
+  // intact -- retiring 5000 neighbours must not have touched it.
+  const std::vector<ClOrdId> open = oms.open_orders();
+  CHECK_EQ(open.size(), std::size_t(1));
+  CHECK_EQ(open[0], resting);
+  CHECK_EQ(oms.working_quantity(0, Side::Buy), Quantity(7));
+}
+
 // ================================================================ timeouts
 
 TEST(oms_expires_orders_that_are_never_acknowledged) {

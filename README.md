@@ -66,9 +66,11 @@ pinning, so they measure this code, not a trading system.
   publication, cache-line padded indices to avoid false sharing, and cached
   copies of the peer index so the common-case push/pop touches no shared state
   (`cpp/include/hft/ring_buffer.hpp`).
-- Cache-conscious limit order book: flat array of price levels (price → level is
-  one subtraction), intrusive doubly-linked FIFOs for time priority, a slab
-  allocator with a free list so add/cancel never allocate after warm-up, and a
+- Cache-conscious limit order book: flat array of price levels, one slot per
+  tradeable price (price → level is `(price - base) / tick_size`, so a coarse
+  tick grid costs proportionally less memory), intrusive doubly-linked FIFOs for
+  time priority, a slab allocator with a free list so add/cancel never allocate
+  after warm-up, and a
   three-tier hierarchical bitmap giving O(1) best-bid/ask via count-leading-zeros
   (`cpp/include/hft/order_book.hpp`).
 - Allocation-free hot paths throughout: OMS records in a slab, incremental
@@ -95,7 +97,7 @@ pinning, so they measure this code, not a trading system.
 **Build, test and tooling**
 - Dual build systems (CMake and plain GNU Make) kept working in parallel, static
   runtime linking for MinGW, `-Wall -Wextra -Wpedantic -Werror`.
-- 245 C++ unit tests under a ~90-line header-only harness, including a
+- 257 C++ unit tests under a ~90-line header-only harness, including a
   randomised **differential test** of the order book against an independently
   maintained shadow model, and journal tests driven by the states a real crash
   leaves behind (truncated mid-record, lost records, flipped bit, missing
@@ -117,8 +119,10 @@ pinning, so they measure this code, not a trading system.
   and CSV dumps.
 - Prometheus instrumentation on a dedicated registry with deliberately bounded
   label cardinality, plus a provisioned Prometheus + Grafana stack.
-- `pytest` / `pytest-asyncio` suite that mocks `yfinance` entirely — no test
-  makes a network call.
+- 59 `pytest` / `pytest-asyncio` tests that mock `yfinance` entirely — no test
+  makes a network call — including a contract test that parses the PromQL out
+  of the committed Grafana dashboard and fails if the exporter no longer
+  publishes a metric or label it queries.
 - Notebook generation and execution automated with `nbformat` / `nbclient` so
   the committed notebook has real outputs.
 
@@ -164,14 +168,14 @@ anything downstream.
 |---|---|---|
 | **Order-flow model** (synthetic) | `cpp/src/feed.cpp` | Deterministic seeded PRNG generating a quiet-equity-book mix: ~70% passive adds near the touch, ~22% cancels of previously added orders, ~8% aggressive marketable orders, around a fair value that random-walks ±1 tick. Same seed ⇒ byte-identical stream. |
 | **Replay model** | `CsvReplayFeed` | Replays a captured CSV (`symbol,type,side,price,quantity,order_id,source_ts_ns,sequence`) so a strategy can be regression-tested against a known episode. |
-| **Book / data model** | `order_book.hpp` | Price-time priority limit order book over a fixed price band. Flat level array + intrusive FIFO per level + three-tier bitmap. |
+| **Book / data model** | `order_book.hpp` | Price-time priority limit order book over a fixed price band. Flat level array (one level per tradeable price, so a coarse tick grid costs proportionally less memory) + intrusive FIFO per level + three-tier bitmap. |
 | **Instrument model** | `instrument.hpp` | Per-instrument price band, tick size, lot size and position ceiling. Book messages violating the contract are rejected; the engine's own orders are snapped onto the tick/lot grid. A per-instrument limit may only tighten the global one. |
 | **Signal / alpha model** | `strategy.hpp`, `hft/core/strategy.py` | Moving-average crossover: a signal fires only when the fast mean crosses the slow mean (the first computed state never fires). The C++ port maintains both averages as running sums over a fixed ring, so `on_tick` is O(1) regardless of window size — the Python version's `sum()` is O(slow_window). Signals are identical, and tested to be. It is a placeholder that exercises the pipeline, not alpha. |
 | **Risk model** | `risk.hpp` | Pre-trade gate ordered cheapest-and-most-fatal-first: kill switch, order validity, fat-finger quantity, fat-finger notional, price collar (bps from reference), per-symbol inventory, gross inventory, order-rate throttle, daily order cap, peak-to-trough drawdown. Fails closed; every rejection is counted by reason. |
 | **Order lifecycle model** | `oms.hpp` | Explicit state machine `PendingNew → New → PartiallyFilled → {Filled, Cancelled, Rejected, Expired}`. Supplies `working_quantity()` to the risk gate and counts every report that does not fit as a reconciliation break. |
-| **Execution / fill model** | `execution.hpp`, `hft/execution/paper.py` | `PaperVenue`. With `cross_book = true` a marketable order is matched against its own instrument's resting depth and filled at the volume-weighted price actually obtained; otherwise it falls back to `reference_price ± slippage_bps`. Fees are `fee_bps` of notional. P&L uses an average-cost basis, realized on the closing portion — accounting deliberately identical to `paper.py` so both sides agree to the cent. |
+| **Execution / fill model** | `execution.hpp`, `hft/execution/paper.py` | `PaperVenue`. With `cross_book = true` a marketable order is matched against its own instrument's resting depth and filled at the volume-weighted price actually obtained; otherwise it falls back to `reference_price ± slippage_bps`. Orders are held for `venue_latency_us` before they may touch the book, so intervening market data is applied first and an order can arrive to find the liquidity gone. Fees are `fee_bps` of notional. P&L uses an average-cost basis, realized on the closing portion — accounting deliberately identical to `paper.py` so both sides agree to the cent. |
 | **Feed-health model** | `feed_health.hpp` | Channel-level sequence validation, tolerated-gap allowance, duplicate/reorder rejection, and a staleness watchdog (`feed_stale_ms`, disabled by default because the right threshold is instrument-specific). |
-| **Latency model** | `latency.hpp`, `hft/metrics/timing.py` | Stage-boundary timestamps recorded into fixed buckets (C++) or samples with percentile summaries (Python). Allocation-free on the record path. |
+| **Latency model** | `latency.hpp`, `hft/metrics/timing.py` | Stage-boundary timestamps recorded into fixed buckets (C++) or samples with percentile summaries (Python). Allocation-free on the record path. Stage boundaries are stamped with `rdtsc` and converted to nanoseconds at report time — one `steady_clock` read per tick anchors the tick on the wall timeline, and the rest cost a couple of cycles rather than the ~100ns a QPC read costs on Windows. |
 
 ### Layout
 
@@ -195,7 +199,7 @@ cpp/                          the C++17 engine
     metrics.*       end-of-run metrics.json + CSV writers
     config.*        key=value config, unknown key is a hard error
     main.cpp        CLI, signal handling, exit codes
-  tests/            245 unit tests + header-only harness
+  tests/            257 unit tests + header-only harness
   bench/            rdtsc microbenchmarks + end-to-end pipeline latency
   config/           engine.conf, the documented reference configuration
   CMakeLists.txt · Makefile · Dockerfile
@@ -262,9 +266,16 @@ order id and moves the order to `PendingNew`. If there is no free slot
 cannot be cancelled or reconciled. With a journal configured, the order is
 written before it can exist at the venue.
 
-**8. The venue fills it.** `PaperVenue` crosses the order against the resting
-depth in its own instrument's book and returns the volume-weighted fill price,
-or falls back to `reference_price ± slippage_bps` when no book is available. The
+**8. The venue fills it.** The order is held for `venue_latency_us` first, so
+every message that arrives while it is on the wire is applied to the book
+before it lands — an order crosses the book that exists when it *arrives*, not
+the one that produced its own signal. (Setting it to zero removes that race
+entirely, which makes any resulting P&L an upper bound rather than an
+estimate.) `PaperVenue` then crosses the order against the resting depth in its
+own instrument's book and returns the volume-weighted fill price. If that side
+of the book is empty the order fills nothing and is counted in `missed_fills`;
+the flat `reference_price ± slippage_bps` model applies only when there is no
+book at all, which is the `paper.py`-equivalent configuration. The
 execution report flows back into the OMS, which transitions the order and
 updates exposure; anything that does not fit the state machine is counted as a
 reconciliation break. Position, average cost, realized P&L, fees and the equity
@@ -289,6 +300,25 @@ The Python pipeline runs the same shape at research scale and without a book:
 `StrategyEngine` drains it and runs the same crossover → `PaperExecutionVenue`
 fills at the reference price with slippage and fees, while `LatencyRecorder`
 captures stage boundaries and (optionally) feeds the Prometheus histograms.
+
+### Where the two implementations genuinely diverge
+
+They are two implementations of one design, not a port, and the honest reading
+of "the same crossover" needs these caveats:
+
+| | C++ engine | Python pipeline |
+| --- | --- | --- |
+| **Price representation** | `std::int64_t` ticks throughout (`kTickScale = 100`) | `float` dollars, because that is what yfinance reports |
+| **Fill prices** | Integer ticks | Computed in integer minor units and returned as dollars (`hft/money.py`), on the same grid and with the same round-half-away-from-zero rule — so the two venues' fills agree to the cent |
+| **Depth** | Fills cross a real order book when `cross_book` is on | No book at all; the flat `reference ± slippage_bps` model only, which is the C++ engine's no-book configuration |
+| **Moving averages** | Running sums over a fixed ring, O(1) per tick | `sum()` over the window, O(slow_window) per tick |
+| **Latency clock** | `rdtsc`, converted at report time | `perf_counter_ns()` |
+
+The price grid was the divergence that mattered, because it is the one that
+made a numeric comparison impossible; `tests/test_money.py` pins the Python
+side to the constant and the rounding rule in `cpp/include/hft/types.hpp` and
+fails if either moves. The remaining differences are structural — a pipeline
+with no book cannot produce a swept fill price no matter how it stores one.
 
 ---
 
@@ -318,9 +348,27 @@ cmake --build cpp/build --parallel
 ctest --test-dir cpp/build --output-on-failure
 ```
 
-CMake options: `-DHFT_STATIC_RUNTIME=ON` (default; links libstdc++/libgcc
-statically, which on MinGW removes the DLL lookup at runtime) and
-`-DHFT_NATIVE_ARCH=ON` (`-march=native`, faster but not portable).
+CMake options:
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `HFT_STATIC_RUNTIME` | `ON` | Links libstdc++/libgcc statically, which on MinGW removes the DLL lookup at runtime |
+| `HFT_NATIVE_ARCH` | `OFF` | `-march=native` — faster, not portable |
+| `HFT_WERROR` | `ON` | `-Werror` / `/WX`, matching the Makefile build |
+| `HFT_SANITIZE` | *(empty)* | Sanitizers to build with, e.g. `"address;undefined"` or `"thread"` |
+
+Warnings and sanitizers come from an `hft_warnings` INTERFACE target that the
+library, the engine, the tests and the bench all link, so every translation
+unit in the project is built with the same diagnostics rather than just the
+ones in `hft_core`. Sanitizer builds need the runtime libraries, which MinGW
+does not ship, and cannot be combined with static runtime linking:
+
+```bash
+cmake -S cpp -B cpp/build-asan -DCMAKE_BUILD_TYPE=Debug \
+      -DHFT_SANITIZE="address;undefined" -DHFT_STATIC_RUNTIME=OFF
+cmake --build cpp/build-asan --parallel
+ctest --test-dir cpp/build-asan --output-on-failure
+```
 
 ### Useful invocations
 
@@ -369,7 +417,8 @@ is the one key that accumulates rather than overwrites.
 
 Key groups: market data (`symbol`, `events`, `seed`, `replay_path`), instruments,
 strategy (`fast_window`, `slow_window`, `order_quantity`), book (`min_price`,
-`max_price`, `ring_capacity`), venue (`slippage_bps`, `fee_bps`, `cross_book`),
+`max_price`, `ring_capacity`), venue (`slippage_bps`, `fee_bps`, `cross_book`,
+`venue_latency_us`),
 risk, order management (`max_open_orders`, `ack_timeout_ms`, `order_sweep_ms`,
 `halt_on_order_timeout`), feed health, durability (`journal_path`,
 `journal_sync`, `allow_unclean_start`, `venue_state_path`) and ops (`threaded`,
@@ -398,7 +447,7 @@ latency percentiles), `latency_summary.csv`, `latency_histogram.csv`,
 
 ```bash
 cd cpp
-make test          # 245 unit tests
+make test          # 257 unit tests
 make hardened      # UBSan trap mode + _GLIBCXX_DEBUG (works on MinGW)
 make asan          # ASan + UBSan (Linux; MinGW ships no sanitizer runtime)
 make ubsan
@@ -458,6 +507,16 @@ python -m hft.main --metrics --symbols AAPL MSFT --poll-interval 2
 The pipeline runs on the host, not in Compose; the stack only observes it. The
 C++ engine is deliberately absent from the scrape config — it writes an
 end-of-run JSON report, not a live endpoint.
+
+The live feed makes a poor demo: it polls once a second per symbol, and a
+crossover needs both a full slow window and an actual crossing, so a quiet
+tape (or a closed market) leaves every panel flat. `scripts/demo_metrics_load.py`
+keeps every real component and swaps in an oscillating price source that
+crosses often enough to light the dashboard up:
+
+```bash
+PYTHONPATH=. python scripts/demo_metrics_load.py --duration 120
+```
 
 ### Environment variables
 

@@ -1,12 +1,35 @@
 #include "hft/feed.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <charconv>
 #include <fstream>
 #include <sstream>
 
 #include "hft/latency.hpp"
 
 namespace hft {
+namespace {
+
+// Strict integer parse for one CSV cell. std::stoll would be shorter and would
+// also throw std::invalid_argument straight out of the constructor on a
+// garbage cell -- taking the process down for a bad input file, while the code
+// around it carefully reports "malformed row at line N" for a missing column.
+// This reports the same way instead.
+bool parse_cell(const std::string& cell, long long& out) {
+  const char* begin = cell.data();
+  const char* end = cell.data() + cell.size();
+  // Surrounding whitespace (including the \r of a CRLF capture) is tolerated;
+  // anything else is not.
+  while (begin != end && std::isspace(static_cast<unsigned char>(*begin))) ++begin;
+  while (end != begin && std::isspace(static_cast<unsigned char>(end[-1]))) --end;
+  if (begin == end) return false;
+
+  const std::from_chars_result r = std::from_chars(begin, end, out);
+  return r.ec == std::errc() && r.ptr == end;
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------- SyntheticFeed
 
@@ -179,12 +202,12 @@ CsvReplayFeed::CsvReplayFeed(const std::string& path) : path_(path) {
     long long vals[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     for (int i = 0; i < 7; ++i) {
       if (!std::getline(ss, cell, ',')) return false;
-      vals[i] = std::stoll(cell);
+      if (!parse_cell(cell, vals[i])) return false;
     }
     // The sequence column was added later. Captures without it still replay,
     // with sequence 0 -- which the feed monitor reads as "unsequenced" rather
     // than as a gap, so an old file does not look like a broken session.
-    if (std::getline(ss, cell, ',') && !cell.empty()) vals[7] = std::stoll(cell);
+    if (std::getline(ss, cell, ',') && !cell.empty() && !parse_cell(cell, vals[7])) return false;
 
     Tick t{};
     t.symbol = static_cast<SymbolId>(vals[0]);

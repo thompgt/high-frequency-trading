@@ -103,6 +103,7 @@ std::string metrics_json(const Engine& engine, const EngineStats& stats,
      << "    \"risk_rejects\": " << stats.risk_rejects << ",\n"
      << "    \"untracked_rejects\": " << stats.untracked_rejects << ",\n"
      << "    \"partial_fills\": " << stats.partial_fills << ",\n"
+     << "    \"missed_fills\": " << stats.missed_fills << ",\n"
      << "    \"timed_out_orders\": " << stats.timed_out_orders << ",\n"
      << "    \"flatten_orders\": " << stats.flatten_orders << ",\n"
      << "    \"fills\": " << venue.fill_count() << ",\n"
@@ -110,9 +111,10 @@ std::string metrics_json(const Engine& engine, const EngineStats& stats,
      << "    \"fees_paid\": " << venue.fees_paid() << ",\n"
      << "    \"positions\": {";
   bool first = true;
-  for (const auto& kv : venue.positions()) {
+  const std::vector<std::int64_t>& held = venue.positions();
+  for (std::size_t sym = 0; sym < held.size(); ++sym) {
     if (!first) os << ", ";
-    os << "\"" << escape(symbols.name(kv.first)) << "\": " << kv.second;
+    os << "\"" << escape(symbols.name(static_cast<SymbolId>(sym))) << "\": " << held[sym];
     first = false;
   }
   os << "}\n  },\n";
