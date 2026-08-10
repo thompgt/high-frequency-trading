@@ -280,6 +280,14 @@ class OrderManager : public ExposureSource {
   std::size_t open_count_ = 0;
   ClOrdId next_id_ = 1;
 
+  // Scratch for sweep_timeouts(), which cannot expire orders while it is
+  // walking the index that tells it which ones to expire. Reserved to the open
+  // cap -- the most that can ever be PendingNew at once -- and cleared per
+  // sweep, so the sweep the engine runs every 100ms does not allocate. The
+  // engine keeps its own scratch for the ids it gets back; this is the one
+  // inside the walk.
+  std::vector<ClOrdId> sweep_scratch_;
+
   std::vector<Exposure> exposure_;  // indexed by SymbolId, grown on demand
   std::int64_t gross_exposure_ = 0;
 

@@ -72,6 +72,7 @@ OrderManager::OrderManager(Config config) : cfg_(config) {
   }
   index_init(capacity);
   retired_.assign(cfg_.retired_history, 0);
+  sweep_scratch_.reserve(cfg_.max_open_orders);
 }
 
 // --- id index (open addressing, linear probe, tombstone deletion) ------------
@@ -464,18 +465,22 @@ bool OrderManager::request_cancel(ClOrdId id, Nanos now_ns) {
 std::size_t OrderManager::sweep_timeouts(Nanos now_ns, std::vector<ClOrdId>* out) {
   std::size_t expired = 0;
   // Walk the index rather than the pool: the working set is small and the pool
-  // is mostly retired records.
-  std::vector<ClOrdId> to_expire;
+  // is mostly retired records. Expiring cannot happen inside the walk --
+  // retire() mutates the very index being walked -- so the ids are collected
+  // first, into a member reserved to the open cap rather than a fresh vector.
+  // This runs every 100ms in steady state; a vector per sweep is exactly the
+  // allocation the engine's own scratch buffer was added to avoid.
+  sweep_scratch_.clear();
   for (std::size_t i = 0; i < id_keys_.size(); ++i) {
     const ClOrdId key = id_keys_[i];
     if (key == kEmptyKey || key == kTombstone) continue;
     const OrderRecord& rec = pool_[id_vals_[i]];
     if (rec.state != OrderState::PendingNew) continue;
     if (now_ns - rec.created_ts_ns < cfg_.ack_timeout_ns) continue;
-    to_expire.push_back(rec.cl_ord_id);
+    sweep_scratch_.push_back(rec.cl_ord_id);
   }
 
-  for (const ClOrdId id : to_expire) {
+  for (const ClOrdId id : sweep_scratch_) {
     const std::uint32_t slot = slot_for(id);
     if (slot == kNilSlot) continue;
     OrderRecord& rec = pool_[slot];

@@ -52,6 +52,8 @@ Engine::Engine(EngineConfig config)
 
   trade_scratch_.reserve(256);
   pending_.reserve(256);
+  // The most that can expire in one sweep is the whole working set.
+  expired_scratch_.reserve(oms_.config().max_open_orders);
   venue_.set_record_curve(config.record_curve);
   // The pre-trade gate must see sent-but-unfilled quantity, not just filled
   // position -- otherwise a burst of in-flight orders walks past the limit.
