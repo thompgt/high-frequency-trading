@@ -8,7 +8,10 @@
 
 namespace hft {
 
-PaperVenue::PaperVenue(Config config) : cfg_(config) { curve_.reserve(4096); }
+PaperVenue::PaperVenue(Config config) : cfg_(config) {
+  curve_.reserve(4096);
+  trade_scratch_.reserve(64);
+}
 
 std::int64_t PaperVenue::position(SymbolId symbol) const {
   auto it = positions_.find(symbol);
@@ -22,13 +25,12 @@ Price PaperVenue::fill_price_for(const Order& order, Price reference_price, Quan
     // Cross the real book -- this instrument's book. The order sweeps resting
     // liquidity, so the average price depends on how deep it has to reach,
     // which is what actual slippage is rather than a flat bps haircut.
-    std::vector<Trade> trades;
-    trades.reserve(8);
+    trade_scratch_.clear();
     const OrderId oid = next_venue_order_id_++;
-    const Quantity got = book->execute_market(oid, order.side, order.quantity, &trades);
+    const Quantity got = book->execute_market(oid, order.side, order.quantity, &trade_scratch_);
     if (got > 0) {
       std::int64_t notional = 0;
-      for (const auto& t : trades) notional += t.price * t.quantity;
+      for (const auto& t : trade_scratch_) notional += t.price * t.quantity;
       filled_qty = got;
       return static_cast<Price>(notional / got);  // volume-weighted average
     }

@@ -112,6 +112,9 @@ class PaperVenue : public ExecutionVenue {
   std::uint64_t fill_count_ = 0;
   bool record_curve_ = true;
   std::vector<PnlPoint> curve_;
+  // Reused across submits so crossing the book never allocates on the
+  // order-send path. Only ever holds the trades of the order in flight.
+  std::vector<Trade> trade_scratch_;
   OrderId next_venue_order_id_ = 1'000'000'000ULL;
 };
 
