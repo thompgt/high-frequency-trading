@@ -508,6 +508,16 @@ The pipeline runs on the host, not in Compose; the stack only observes it. The
 C++ engine is deliberately absent from the scrape config — it writes an
 end-of-run JSON report, not a live endpoint.
 
+The live feed makes a poor demo: it polls once a second per symbol, and a
+crossover needs both a full slow window and an actual crossing, so a quiet
+tape (or a closed market) leaves every panel flat. `scripts/demo_metrics_load.py`
+keeps every real component and swaps in an oscillating price source that
+crosses often enough to light the dashboard up:
+
+```bash
+PYTHONPATH=. python scripts/demo_metrics_load.py --duration 120
+```
+
 ### Environment variables
 
 | Variable | Effect |
