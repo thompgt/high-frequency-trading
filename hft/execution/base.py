@@ -5,9 +5,10 @@ strategy engine never needs to change."""
 from __future__ import annotations
 
 import abc
-import time
 from dataclasses import dataclass, field
 from typing import Literal
+
+from hft.clock import monotonic_ns
 
 Side = Literal["BUY", "SELL"]
 
@@ -17,7 +18,7 @@ class Order:
     symbol: str
     side: Side
     quantity: int
-    created_ts_ns: int = field(default_factory=time.time_ns)
+    created_ts_ns: int = field(default_factory=monotonic_ns)
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,7 +27,7 @@ class Fill:
     side: Side
     quantity: int
     price: float
-    filled_ts_ns: int = field(default_factory=time.time_ns)
+    filled_ts_ns: int = field(default_factory=monotonic_ns)
 
 
 class ExecutionVenue(abc.ABC):
