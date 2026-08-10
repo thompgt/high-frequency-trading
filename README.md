@@ -119,8 +119,10 @@ pinning, so they measure this code, not a trading system.
   and CSV dumps.
 - Prometheus instrumentation on a dedicated registry with deliberately bounded
   label cardinality, plus a provisioned Prometheus + Grafana stack.
-- `pytest` / `pytest-asyncio` suite that mocks `yfinance` entirely — no test
-  makes a network call.
+- 47 `pytest` / `pytest-asyncio` tests that mock `yfinance` entirely — no test
+  makes a network call — including a contract test that parses the PromQL out
+  of the committed Grafana dashboard and fails if the exporter no longer
+  publishes a metric or label it queries.
 - Notebook generation and execution automated with `nbformat` / `nbclient` so
   the committed notebook has real outputs.
 
