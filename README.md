@@ -327,9 +327,27 @@ cmake --build cpp/build --parallel
 ctest --test-dir cpp/build --output-on-failure
 ```
 
-CMake options: `-DHFT_STATIC_RUNTIME=ON` (default; links libstdc++/libgcc
-statically, which on MinGW removes the DLL lookup at runtime) and
-`-DHFT_NATIVE_ARCH=ON` (`-march=native`, faster but not portable).
+CMake options:
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `HFT_STATIC_RUNTIME` | `ON` | Links libstdc++/libgcc statically, which on MinGW removes the DLL lookup at runtime |
+| `HFT_NATIVE_ARCH` | `OFF` | `-march=native` — faster, not portable |
+| `HFT_WERROR` | `ON` | `-Werror` / `/WX`, matching the Makefile build |
+| `HFT_SANITIZE` | *(empty)* | Sanitizers to build with, e.g. `"address;undefined"` or `"thread"` |
+
+Warnings and sanitizers come from an `hft_warnings` INTERFACE target that the
+library, the engine, the tests and the bench all link, so every translation
+unit in the project is built with the same diagnostics rather than just the
+ones in `hft_core`. Sanitizer builds need the runtime libraries, which MinGW
+does not ship, and cannot be combined with static runtime linking:
+
+```bash
+cmake -S cpp -B cpp/build-asan -DCMAKE_BUILD_TYPE=Debug \
+      -DHFT_SANITIZE="address;undefined" -DHFT_STATIC_RUNTIME=OFF
+cmake --build cpp/build-asan --parallel
+ctest --test-dir cpp/build-asan --output-on-failure
+```
 
 ### Useful invocations
 
